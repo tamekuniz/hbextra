@@ -1,0 +1,1154 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>はてブニュース+</title>
+  <style>
+    :root {
+      --primary: #008fde;
+      --primary-dark: #006fae;
+      --bg: #f0f2f5;
+      --card: #fff;
+      --text: #222;
+      --muted: #666;
+      --border: #e0e0e0;
+      --tag-bg: #eef2f7;
+      --tag-fg: #3366aa;
+      --star: #f5d800;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { overflow-anchor: none; } /* タグ絞り込み時のスクロールアンカー補正を無効化 */
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Kaku Gothic ProN', 'Meiryo', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    #header {
+      background: var(--primary);
+      color: #fff;
+      padding: 10px 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(0,0,0,.18);
+    }
+    .header-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 960px;
+      margin: 0 auto;
+      flex-wrap: wrap;
+    }
+    .site-title { font-size: 18px; font-weight: 700; white-space: nowrap; }
+    .site-title sup { font-size: 11px; font-weight: 400; opacity: .8; }
+
+    #search-input {
+      flex: 1;
+      min-width: 160px;
+      padding: 7px 14px;
+      border-radius: 20px;
+      border: none;
+      font-size: 14px;
+      background: rgba(255,255,255,.9);
+      color: var(--text);
+    }
+    #search-input:focus { outline: none; background: #fff; }
+
+    .hbtn {
+      background: rgba(255,255,255,.2);
+      border: 1px solid rgba(255,255,255,.4);
+      color: #fff;
+      padding: 5px 12px;
+      border-radius: 16px;
+      cursor: pointer;
+      font-size: 13px;
+      white-space: nowrap;
+      transition: background .15s;
+    }
+    .hbtn:hover { background: rgba(255,255,255,.35); }
+    .hbtn.active { background: rgba(255,255,255,.55); color: var(--primary-dark); font-weight: 600; }
+
+    /* ── Layout ── */
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 12px 16px 48px;
+    }
+
+    /* ── Category bar ── */
+    #cat-bar { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
+    .cat-chip {
+      padding: 3px 11px;
+      border-radius: 14px;
+      font-size: 12px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--muted);
+      transition: all .15s;
+      user-select: none;
+    }
+    .cat-chip:hover { border-color: var(--primary); color: var(--primary); }
+    .cat-chip.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+    /* ── Status + keyboard hint ── */
+    .status-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      padding: 4px 0 8px;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    #status { font-size: 12px; color: var(--muted); }
+    .kb-hint { font-size: 11px; color: #aaa; }
+    kbd {
+      background: #f0f0f0;
+      border: 1px solid #bbb;
+      border-radius: 3px;
+      padding: 0 4px;
+      font-size: 10px;
+      font-family: monospace;
+    }
+
+    /* ── Star / Dismissed filter ── */
+    #star-filter-btn, #dismissed-filter-btn {
+      padding: 3px 11px;
+      border-radius: 14px;
+      font-size: 12px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--muted);
+      transition: all .15s;
+      user-select: none;
+    }
+    #star-filter-btn:hover { border-color: var(--star); color: var(--star); }
+    #star-filter-btn.active { background: var(--star); color: #fff; border-color: var(--star); }
+    #dismissed-filter-btn:hover { border-color: #e03030; color: #e03030; }
+    #dismissed-filter-btn.active { background: #e03030; color: #fff; border-color: #e03030; }
+    .restore-btn {
+      background: none; border: none; cursor: pointer;
+      padding: 2px 5px; border-radius: 4px;
+      font-size: 13px; line-height: 1;
+      opacity: 0; transition: opacity .15s, color .15s;
+    }
+    .entry-card:hover .restore-btn,
+    .entry-card.focused .restore-btn { opacity: .45; }
+    .restore-btn:hover { opacity: 1 !important; color: #2a9d2a; }
+
+    /* ── Settings buttons ── */
+    .settings-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+    .settings-btn {
+      padding: 3px 11px;
+      border-radius: 14px;
+      font-size: 12px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--muted);
+      transition: all .15s;
+      user-select: none;
+    }
+    .settings-btn:hover { border-color: var(--primary); color: var(--primary); }
+
+    /* ── Tag cloud ── */
+    #tag-cloud-wrap, #tag-cloud-all-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+    }
+    .cloud-label { font-size: 11px; color: var(--muted); margin-bottom: 7px; }
+    .cloud-label-sub { font-size: 11px; color: var(--muted); }
+    .cloud-header { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; flex-wrap: wrap; }
+    .cloud-header .cloud-label { margin-bottom: 0; }
+    .cloud-header-sep { width: 1px; height: 14px; background: var(--border); flex-shrink: 0; }
+    .sort-btn, .period-btn {
+      font-size: 10px; padding: 2px 7px; border-radius: 10px;
+      border: 1px solid var(--border); background: none;
+      color: var(--muted); cursor: pointer; line-height: 1.6; white-space: nowrap;
+    }
+    .sort-btn:hover, .period-btn:hover { border-color: var(--primary); color: var(--primary); }
+    .sort-btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .period-btn.active { background: var(--accent, #555); border-color: var(--accent, #555); color: #fff; }
+    #tag-cloud { display: flex; flex-wrap: wrap; gap: 5px; }
+
+    /* ── Entry cards ── */
+    .entry-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 8px;
+      transition: box-shadow .15s, border-color .15s;
+      position: relative;
+    }
+    .entry-card:hover { box-shadow: 0 2px 14px rgba(0,0,0,.08); }
+    .entry-card.focused {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(0,143,222,.15);
+    }
+
+    .entry-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+    }
+    .bcount {
+      background: #e04b28;
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 10px;
+      white-space: nowrap;
+    }
+    .entry-cat {
+      font-size: 11px;
+      color: var(--primary);
+      background: #e8f4fc;
+      padding: 2px 7px;
+      border-radius: 10px;
+    }
+    .entry-date { font-size: 11px; color: var(--muted); }
+
+    /* star + dismiss buttons (right side of meta) */
+    .entry-actions { margin-left: auto; display: flex; gap: 2px; }
+    .star-btn, .dismiss-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-size: 15px;
+      line-height: 1;
+      opacity: 0;
+      transition: opacity .15s, color .15s;
+    }
+    .entry-card:hover .star-btn,
+    .entry-card:hover .dismiss-btn,
+    .entry-card.focused .star-btn,
+    .entry-card.focused .dismiss-btn { opacity: .45; }
+    .star-btn:hover { opacity: 1 !important; color: var(--star); }
+    .dismiss-btn:hover { opacity: 1 !important; color: #e03030; }
+    .star-btn.on { opacity: 1 !important; color: var(--star); }
+
+    .entry-title a {
+      font-size: 15px;
+      font-weight: 500;
+      color: var(--text);
+      text-decoration: none;
+      line-height: 1.45;
+    }
+    .entry-title a:hover { color: var(--primary); text-decoration: underline; }
+
+    .entry-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; min-height: 20px; }
+
+    /* ── Tag chips ── */
+    .tag-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      padding: 2px 9px;
+      border-radius: 12px;
+      font-size: 11px;
+      background: var(--tag-bg);
+      color: var(--tag-fg);
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all .15s;
+      user-select: none;
+    }
+    .tag-chip:hover, .tag-chip.active { background: var(--primary); color: #fff; }
+    .tag-cnt { font-size: 10px; color: #d04a10; opacity: .9; }
+    .tag-loading { font-size: 11px; color: #bbb; }
+
+    /* ── Pagination ── */
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 12px 0 4px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .page-btn {
+      padding: 4px 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--card);
+      cursor: pointer;
+      font-size: 13px;
+      transition: all .15s;
+    }
+    .page-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+    .page-btn:disabled { opacity: 0.35; cursor: default; }
+
+    /* ── States ── */
+    #loading-msg, #no-results { text-align: center; padding: 40px; color: var(--muted); }
+
+    /* ── Footer spacer（タグ絞り込み時のレイアウトシフト防止） ── */
+    #page-footer { height: 48px; }
+
+    @media (max-width: 600px) {
+      .site-title { font-size: 15px; }
+    }
+
+    /* ── Preview Modal ── */
+    #preview-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      background: rgba(0,0,0,.65);
+      align-items: center;
+      justify-content: center;
+    }
+    #preview-modal.open { display: flex; }
+    #preview-box {
+      width: 92vw;
+      height: 90vh;
+      display: flex;
+      flex-direction: column;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 16px 64px rgba(0,0,0,.6);
+    }
+    #preview-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      background: #1e1e2e;
+      flex-shrink: 0;
+      min-height: 36px;
+    }
+    #preview-bar-url {
+      flex: 1;
+      font-size: 11px;
+      color: #aaa;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #preview-bar-url a { color: #7ab4ff; text-decoration: none; }
+    #preview-bar-url a:hover { text-decoration: underline; }
+    #preview-hint {
+      font-size: 10px;
+      color: #666;
+      flex-shrink: 0;
+    }
+    #preview-close {
+      flex-shrink: 0;
+      background: none;
+      border: none;
+      font-size: 15px;
+      line-height: 1;
+      color: #888;
+      cursor: pointer;
+      padding: 3px 7px;
+      border-radius: 4px;
+    }
+    #preview-close:hover { background: rgba(255,255,255,.12); color: #fff; }
+    #preview-iframe {
+      flex: 1;
+      border: none;
+      background: #fff;
+    }
+    .tag-filter-input {
+      font-size: 11px; padding: 2px 8px; border-radius: 3px;
+      border: 1px solid var(--border); background: #fff; color: var(--text);
+      outline: none; width: 110px;
+    }
+    .tag-filter-input:focus { border-color: var(--primary); }
+    .tag-filter-input::placeholder { color: var(--muted); }
+  </style>
+  <script>
+  // ─── 簡易ローマ字→ひらがな変換 ─────────────────────────────
+  const _r2h = (() => {
+    const tbl = [
+      ['sha','しゃ'],['shi','し'],['shu','しゅ'],['she','しぇ'],['sho','しょ'],
+      ['sya','しゃ'],['syi','し'],['syu','しゅ'],['sye','しぇ'],['syo','しょ'],
+      ['chi','ち'],['cha','ちゃ'],['chu','ちゅ'],['che','ちぇ'],['cho','ちょ'],
+      ['tya','ちゃ'],['tyi','ち'],['tyu','ちゅ'],['tye','ちぇ'],['tyo','ちょ'],
+      ['thi','てぃ'],['tha','てゃ'],['thu','てゅ'],['tho','てょ'],
+      ['tsu','つ'],['tsi','つぃ'],
+      ['dhi','でぃ'],['dhu','でゅ'],
+      ['dzi','ぢ'],['dza','ぢゃ'],['dzu','づ'],['dze','ぢぇ'],['dzo','ぢょ'],
+      ['nya','にゃ'],['nyi','に'],['nyu','にゅ'],['nye','にぇ'],['nyo','にょ'],
+      ['hya','ひゃ'],['hyi','ひ'],['hyu','ひゅ'],['hye','ひぇ'],['hyo','ひょ'],
+      ['mya','みゃ'],['myi','み'],['myu','みゅ'],['mye','みぇ'],['myo','みょ'],
+      ['rya','りゃ'],['ryi','り'],['ryu','りゅ'],['rye','りぇ'],['ryo','りょ'],
+      ['bya','びゃ'],['byi','び'],['byu','びゅ'],['bye','びぇ'],['byo','びょ'],
+      ['pya','ぴゃ'],['pyi','ぴ'],['pyu','ぴゅ'],['pye','ぴぇ'],['pyo','ぴょ'],
+      ['gya','ぎゃ'],['gyi','ぎ'],['gyu','ぎゅ'],['gye','ぎぇ'],['gyo','ぎょ'],
+      ['kya','きゃ'],['kyi','き'],['kyu','きゅ'],['kye','きぇ'],['kyo','きょ'],
+      ['fa','ふぁ'],['fi','ふぃ'],['fu','ふ'],['fe','ふぇ'],['fo','ふぉ'],
+      ['wi','うぃ'],['we','うぇ'],['wo','うぉ'],
+      ['wha','うぁ'],
+      ['va','ゔぁ'],['vi','ゔぃ'],['vu','ゔ'],['ve','ゔぇ'],['vo','ゔぉ'],
+      ['ja','じゃ'],['ji','じ'],['ju','じゅ'],['je','じぇ'],['jo','じょ'],
+      ['jya','じゃ'],['jyi','じ'],['jyu','じゅ'],['jye','じぇ'],['jyo','じょ'],
+      ['zya','じゃ'],['zyi','じ'],['zyu','じゅ'],['zye','じぇ'],['zyo','じょ'],
+      ['ka','か'],['ki','き'],['ku','く'],['ke','け'],['ko','こ'],
+      ['sa','さ'],['si','し'],['su','す'],['se','せ'],['so','そ'],
+      ['ta','た'],['ti','ち'],['tu','つ'],['te','て'],['to','と'],
+      ['na','な'],['ni','に'],['nu','ぬ'],['ne','ね'],['no','の'],
+      ['ha','は'],['hi','ひ'],['hu','ふ'],['he','へ'],['ho','ほ'],
+      ['ma','ま'],['mi','み'],['mu','む'],['me','め'],['mo','も'],
+      ['ya','や'],['yu','ゆ'],['ye','いぇ'],['yo','よ'],
+      ['ra','ら'],['ri','り'],['ru','る'],['re','れ'],['ro','ろ'],
+      ['wa','わ'],['wi','ゐ'],['we','ゑ'],['wo','を'],
+      ['ga','が'],['gi','ぎ'],['gu','ぐ'],['ge','げ'],['go','ご'],
+      ['za','ざ'],['zi','じ'],['zu','ず'],['ze','ぜ'],['zo','ぞ'],
+      ['da','だ'],['di','ぢ'],['du','づ'],['de','で'],['do','ど'],
+      ['ba','ば'],['bi','び'],['bu','ぶ'],['be','べ'],['bo','ぼ'],
+      ['pa','ぱ'],['pi','ぴ'],['pu','ぷ'],['pe','ぺ'],['po','ぽ'],
+      ['a','あ'],['i','い'],['u','う'],['e','え'],['o','お'],
+      ['n','ん'],
+    ];
+    return function romajiToHiragana(s) {
+      let out = '', i = 0;
+      s = s.toLowerCase();
+      while (i < s.length) {
+        // っ (double consonant)
+        if (s[i] === s[i+1] && 'bcdfghjklmnpqrstvwxyz'.includes(s[i])) {
+          out += 'っ'; i++; continue;
+        }
+        let matched = false;
+        for (const [r, h] of tbl) {
+          if (s.startsWith(r, i)) { out += h; i += r.length; matched = true; break; }
+        }
+        if (!matched) { out += s[i]; i++; }
+      }
+      return out;
+    };
+  })();
+  </script>
+</head>
+<body>
+
+<div id="header">
+  <div class="header-row">
+    <div class="site-title">はてブニュース<sup>+</sup></div>
+    <input type="search" id="search-input" placeholder="記事・タグを検索…" autocomplete="off">
+    <button class="hbtn active" id="btn-new" onclick="setMode('new')">新着</button>
+    <button class="hbtn"        id="btn-hot" onclick="setMode('hot')">人気</button>
+    <button class="hbtn" onclick="doRefresh()">↻&nbsp;更新</button>
+  </div>
+</div>
+
+<div class="container">
+  <div id="cat-bar">
+    <div class="cat-chip active" data-cat=""              onclick="setCat('')">すべて</div>
+    <div class="cat-chip" data-cat="it"            onclick="setCat('it')">テクノロジー</div>
+    <div class="cat-chip" data-cat="social"        onclick="setCat('social')">世の中</div>
+    <div class="cat-chip" data-cat="fun"           onclick="setCat('fun')">おもしろ</div>
+    <div class="cat-chip" data-cat="entertainment" onclick="setCat('entertainment')">エンタメ</div>
+    <div class="cat-chip" data-cat="knowledge"     onclick="setCat('knowledge')">学び</div>
+    <div class="cat-chip" data-cat="life"          onclick="setCat('life')">暮らし</div>
+    <div class="cat-chip" data-cat="economics"     onclick="setCat('economics')">政治・経済</div>
+    <div class="cat-chip" data-cat="game"          onclick="setCat('game')">ゲーム</div>
+    <div class="cat-chip" data-cat="anime"         onclick="setCat('anime')">アニメ</div>
+  </div>
+
+  <div class="status-row">
+    <div id="status"><span id="status-text"></span><span id="next-refresh" style="margin-left:8px;opacity:.7"></span></div>
+    <div class="kb-hint">
+      <kbd>j</kbd><kbd>k</kbd>移動 &nbsp;
+      <kbd>v</kbd>プレビュー &nbsp;
+      <kbd>b</kbd>開く &nbsp;
+      <kbd>s</kbd>スター &nbsp;
+      <kbd>d</kbd>非表示 &nbsp;
+      <kbd>h</kbd><kbd>l</kbd>ページ &nbsp;
+      <kbd>/</kbd>検索
+    </div>
+  </div>
+
+  <div class="settings-row">
+    <button id="star-filter-btn" onclick="toggleStarFilter()">★ スターのみ</button>
+    <button id="dismissed-filter-btn" onclick="toggleDismissedFilter()">✕ 非表示一覧</button>
+    <button class="settings-btn" onclick="exportSettings()" title="starred/dismissedをJSONでエクスポート">エクスポート</button>
+    <button class="settings-btn" onclick="document.getElementById('import-input').click()" title="JSONからインポート">インポート</button>
+    <input type="file" id="import-input" accept=".json" style="display:none" onchange="importSettings(this.files[0]); this.value=''">
+  </div>
+
+  <div id="tag-cloud-wrap" style="display:none">
+    <div id="tag-cloud"></div>
+  </div>
+
+  <div id="loading-msg">読み込み中…</div>
+  <div id="no-results" style="display:none">該当する記事がありません。</div>
+  <div id="pagination-top"></div>
+  <div id="entries"></div>
+  <div id="pagination"></div>
+
+  <div id="tag-cloud-all-wrap" style="display:none">
+    <div class="cloud-header">
+      <button class="period-btn" data-period="today"     onclick="setTagPeriod('today')">今日</button>
+      <button class="period-btn" data-period="yesterday" onclick="setTagPeriod('yesterday')">昨日</button>
+      <button class="period-btn" data-period="7d"        onclick="setTagPeriod('7d')">1週間</button>
+      <button class="period-btn" data-period="30d"       onclick="setTagPeriod('30d')">1ヶ月</button>
+      <button class="period-btn" data-period="90d"       onclick="setTagPeriod('90d')">3ヶ月</button>
+      <button class="period-btn" data-period="1y"        onclick="setTagPeriod('1y')">1年</button>
+      <button class="period-btn" data-period="all"       onclick="setTagPeriod('all')">全期間</button>
+      <input id="tag-filter-input" class="tag-filter-input" type="text"
+             placeholder="タグを絞り込み…"
+             oninput="filterAllTags(this.value)"
+             onkeydown="if(event.key==='Escape'){this.value='';filterAllTags('');this.blur();}">
+    </div>
+    <div class="cloud-header">
+      <div class="cloud-label-sub">並び順：</div>
+      <button class="sort-btn" data-sort="count"  onclick="setAllTagSort('count')">件数順</button>
+      <button class="sort-btn" data-sort="latest" onclick="setAllTagSort('latest')">最新順</button>
+      <button class="sort-btn" data-sort="alpha"  onclick="setAllTagSort('alpha')">文字順</button>
+    </div>
+    <div id="tag-cloud-all"></div>
+  </div>
+</div>
+<div id="page-footer"></div>
+
+<!-- ── Preview Modal ── -->
+<div id="preview-modal" role="dialog" aria-modal="true">
+  <div id="preview-box">
+    <div id="preview-bar">
+      <div id="preview-bar-url"></div>
+      <span id="preview-hint">Space: スクロール　V / Esc: 閉じる</span>
+      <button id="preview-close" onclick="closePreview()" title="閉じる（V / Esc）">✕</button>
+    </div>
+    <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+  </div>
+</div>
+
+<script>'use strict';
+
+// ─── Config ──────────────────────────────────────────────────
+const PAGE_SIZE      = 50;
+const AUTO_REFRESH_MS = 10 * 60 * 1000;
+
+// ─── State ───────────────────────────────────────────────────
+let st = { mode: 'new', cat: '', search: '', tag: null, page: 0, starOnly: false, dismissedOnly: false };
+let allEntries = [];   // 現在ページの記事（サーバーから取得）
+let totalCount = 0;    // フィルタ後の総件数
+let allTags    = [];   // 全期間タグ（サーバーから取得）
+let focusIdx   = -1;
+let nextRefreshAt = 0;
+let tagWatcher = null;
+
+// ─── API helpers ─────────────────────────────────────────────
+async function apiFetch(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+async function apiPost(path, body) {
+  return apiFetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+function entryParams() {
+  return new URLSearchParams({
+    mode: st.mode, cat: st.cat, page: st.page,
+    per_page: PAGE_SIZE, search: st.search || '',
+    tag: st.tag || '', star_only: st.starOnly,
+    dismissed_only: st.dismissedOnly,
+  });
+}
+
+// ─── Render helpers ───────────────────────────────────────────
+function h(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function eid(url) {
+  return 'tag_' + Math.abs(url.split('').reduce((a,c) => (a<<5)-a+c.charCodeAt(0),0)).toString(36);
+}
+function tagChips(tags, limit = 10) {
+  return tags.slice(0, limit).map(({tag}) =>
+    `<span class="tag-chip${st.tag===tag?' active':''}" data-tag="${h(tag)}" onclick="toggleTag(this.dataset.tag)">${h(tag)}</span>`
+  ).join('');
+}
+function fmtDate(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt)) return '';
+  const yyyy = dt.getFullYear();
+  const mm   = String(dt.getMonth()+1).padStart(2,'0');
+  const dd   = String(dt.getDate()).padStart(2,'0');
+  const hh   = String(dt.getHours()).padStart(2,'0');
+  const mn   = String(dt.getMinutes()).padStart(2,'0');
+  return `${yyyy}-${mm}-${dd} ${hh}:${mn}`;
+}
+
+function renderEntry(e, idx) {
+  const tagsSection = e.tagsLoaded
+    ? (e.tags.length ? `<div class="entry-tags">${tagChips(e.tags)}</div>` : '')
+    : `<div class="entry-tags" id="${eid(e.url)}"><span class="tag-loading">タグ読み込み中…</span></div>`;
+  return `<div class="entry-card" data-url="${h(e.url)}" data-idx="${idx}" onclick="cardClick(event,${idx})">
+  <div class="entry-meta">
+    ${fmtDate(e.date) ? `<span class="entry-date">${fmtDate(e.date)}</span>` : ''}
+    <span class="bcount">${e.count} users</span>
+    <span class="entry-actions">
+      <button class="star-btn${e.starred?' on':''}" onclick="toggleStar('${h(e.url)}')" title="スター (s)">${e.starred ? '★' : '☆'}</button>
+      ${st.dismissedOnly
+        ? `<button class="restore-btn" onclick="undismissEntry('${h(e.url)}')" title="復元 (d)">↩</button>`
+        : `<button class="dismiss-btn" onclick="dismissEntry('${h(e.url)}')" title="非表示 (d)">✕</button>`}
+    </span>
+  </div>
+  <div class="entry-title"><a href="${h(e.url)}" target="_blank" rel="noopener noreferrer">${h(e.title)}</a></div>
+  ${tagsSection}
+</div>`;
+}
+
+function renderAll() {
+  const entriesEl = document.getElementById('entries');
+  const noRes     = document.getElementById('no-results');
+  document.getElementById('loading-msg').style.display = 'none';
+  focusIdx = -1;
+  if (!allEntries.length) {
+    entriesEl.innerHTML = '';
+    noRes.style.display = '';
+  } else {
+    noRes.style.display = 'none';
+    entriesEl.innerHTML = allEntries.map((e, i) => renderEntry(e, i)).join('');
+  }
+  renderPagination(totalCount);
+  renderTagCloud();
+}
+
+function renderPagination(total) {
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const html = pages <= 1 ? '' : `
+    <div class="pagination">
+      <button class="page-btn" onclick="goPage(${st.page - 1})" ${st.page===0?'disabled':''}>← 次へ（新しい）</button>
+      <span>${st.page + 1} / ${pages} ページ（計${total}件）</span>
+      <button class="page-btn" onclick="goPage(${st.page + 1})" ${st.page>=pages-1?'disabled':''}>前へ（古い）→</button>
+    </div>`;
+  document.getElementById('pagination-top').innerHTML = html;
+  document.getElementById('pagination').innerHTML     = html;
+}
+
+function _tagChipsFull(tags) {
+  return tags.map(({tag, count}) =>
+    `<span class="tag-chip${st.tag===tag?' active':''}" data-tag="${h(tag)}" onclick="toggleTag(this.dataset.tag)">${h(tag)}<span class="tag-cnt"> ${count}</span></span>`
+  ).join('');
+}
+let allTagSort   = localStorage.getItem('allTagSort')   || 'count';
+let allTagPeriod = localStorage.getItem('allTagPeriod') || 'all';
+let allTagQuery  = '';
+let _tagCloudNaturalHeight = 0;  // 絞り込み前の自然な高さ（レイアウトシフト防止用）
+
+function filterAllTags(q) {
+  const footer = document.getElementById('page-footer');
+  if (q && !allTagQuery) {
+    // 絞り込み開始：自然な高さを同期的に記録し、フッターを拡張してページ高さを維持
+    const container = document.getElementById('tag-cloud-all');
+    const ht = container.offsetHeight;
+    if (ht > 0) _tagCloudNaturalHeight = ht;
+    footer.style.height = '100vh';
+  } else if (!q && allTagQuery) {
+    // 絞り込みクリア：タグクラウドが元の高さに戻るのと同時にフッターを縮小
+    footer.style.height = '';
+  }
+  allTagQuery = q;
+  renderAllTagCloud();
+}
+
+function setAllTagSort(s) {
+  allTagSort = s;
+  localStorage.setItem('allTagSort', s);
+  renderAllTagCloud();
+}
+
+async function fetchTagsForPeriod() {
+  const params = new URLSearchParams({ mode: st.mode, cat: st.cat, period: allTagPeriod });
+  try {
+    const data = await apiFetch(`/api/tags?${params}`);
+    allTags = data.tags || [];
+    renderAllTagCloud();
+  } catch(_) {}
+}
+
+function setTagPeriod(p) {
+  allTagPeriod = p;
+  localStorage.setItem('allTagPeriod', p);
+  if (p === 'all') {
+    // allTags は直近の init/goPage で既にロード済みなのでそのまま使う
+    renderAllTagCloud();
+  } else {
+    fetchTagsForPeriod();
+  }
+}
+
+function sortedAllTags() {
+  const tags = [...allTags];
+  if (allTagSort === 'latest') {
+    tags.sort((a, b) => (b.last || '') > (a.last || '') ? 1 : -1);
+  } else if (allTagSort === 'alpha') {
+    tags.sort((a, b) => a.tag.localeCompare(b.tag, 'ja'));
+  } else {
+    tags.sort((a, b) => b.count - a.count);
+  }
+  return tags;
+}
+
+function renderAllTagCloud() {
+  document.querySelectorAll('.sort-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.sort === allTagSort)
+  );
+  document.querySelectorAll('.period-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.period === allTagPeriod)
+  );
+  const wrapAll = document.getElementById('tag-cloud-all-wrap');
+  if (!allTags.length) { wrapAll.style.display = 'none'; return; }
+  wrapAll.style.display = '';
+  const container = document.getElementById('tag-cloud-all');
+  let tags = sortedAllTags();
+  if (allTagQuery) {
+    const q = allTagQuery.toLowerCase();
+    // ローマ字入力をひらがなに変換
+    const qHira = _r2h(q);
+    tags = tags.filter(t => {
+      if (t.tag.toLowerCase().includes(q)) return true;              // 直接一致
+      if (t.reading && t.reading.includes(q)) return true;           // 読み（ひらがな）の直接一致
+      if (qHira && t.reading && t.reading.includes(qHira)) return true; // ローマ字→ひらがな変換後の一致
+      return false;
+    });
+    // 絞り込み中は自然な高さを min-height として維持（レイアウトシフト防止）
+    if (_tagCloudNaturalHeight > 0) {
+      container.style.minHeight = _tagCloudNaturalHeight + 'px';
+    }
+  } else {
+    // 絞り込みなし → min-height をリセット
+    container.style.minHeight = '';
+  }
+  container.innerHTML = _tagChipsFull(tags);
+  // 絞り込みなし時に高さを同期的に記録（offsetHeight で強制レイアウト）
+  if (!allTagQuery) {
+    const ht = container.offsetHeight;
+    if (ht > 0) _tagCloudNaturalHeight = ht;
+  }
+}
+
+function renderTagCloud() {
+  // 上部：現在ページの記事からタグを集計
+  const cnt = {};
+  for (const e of allEntries) {
+    for (const {tag, count} of e.tags) cnt[tag] = (cnt[tag] ?? 0) + count;
+  }
+  const pageTags = Object.entries(cnt).filter(([,c])=>c>1).sort((a,b)=>b[1]-a[1]).map(([tag,count]) => ({tag, count}));
+  const wrap = document.getElementById('tag-cloud-wrap');
+  if (!pageTags.length) { wrap.style.display = 'none'; }
+  else { wrap.style.display = ''; document.getElementById('tag-cloud').innerHTML = _tagChipsFull(pageTags); }
+
+  // 下部：全期間タグ（サーバー集計）
+  renderAllTagCloud();
+}
+
+// ─── Tag watcher (5秒ごとにタグ状態を確認) ───────────────────
+function startTagWatcher() {
+  if (tagWatcher) clearInterval(tagWatcher);
+  if (allEntries.every(e => e.tagsLoaded)) return;
+  tagWatcher = setInterval(async () => {
+    try {
+      const data = await apiFetch(`/api/entries?${entryParams()}`);
+      const prev  = allEntries;
+      allEntries  = data.entries;
+      totalCount  = data.total;
+      if (allTagPeriod === 'all') allTags = data.top_tags_all || [];
+      for (const e of allEntries) {
+        if (e.tagsLoaded && !prev.find(p => p.url === e.url)?.tagsLoaded) {
+          const el = document.getElementById(eid(e.url));
+          if (el) el.outerHTML = e.tags.length
+            ? `<div class="entry-tags">${tagChips(e.tags)}</div>`
+            : '<div class="entry-tags"></div>';
+        }
+      }
+      renderTagCloud();
+      if (allEntries.every(e => e.tagsLoaded)) clearInterval(tagWatcher);
+    } catch(_) {}
+  }, 5000);
+}
+
+// ─── Init ─────────────────────────────────────────────────────
+async function init() {
+  st.page = 0;
+  if (tagWatcher) { clearInterval(tagWatcher); tagWatcher = null; }
+  document.getElementById('loading-msg').style.display = '';
+  document.getElementById('loading-msg').textContent   = '読み込み中…';
+  document.getElementById('entries').innerHTML = '';
+  document.getElementById('pagination').innerHTML = '';
+  document.getElementById('no-results').style.display  = 'none';
+  document.getElementById('tag-cloud-wrap').style.display = 'none';
+  document.getElementById('tag-cloud-all-wrap').style.display = 'none';
+  setStatus('読み込み中…');
+  try {
+    const data = await apiFetch(`/api/entries?${entryParams()}`);
+    allEntries = data.entries;
+    totalCount = data.total;
+    if (allTagPeriod === 'all') allTags = data.top_tags_all || [];
+    else fetchTagsForPeriod();
+    setStatus(`${totalCount}件 ／ 更新: ${new Date().toLocaleTimeString('ja-JP')}`);
+    renderAll();
+    startTagWatcher();
+  } catch(e) {
+    document.getElementById('loading-msg').textContent = '⚠ データの取得に失敗しました。';
+    setStatus('取得失敗', true);
+  }
+}
+
+// ─── UI handlers ─────────────────────────────────────────────
+function setStatus(msg, warn = false) {
+  const el = document.getElementById('status-text');
+  el.textContent = msg;
+  el.style.color = warn ? '#c00' : '';
+}
+
+function setMode(mode) {
+  st.mode = mode; st.tag = null;
+  document.getElementById('btn-new').classList.toggle('active', mode === 'new');
+  document.getElementById('btn-hot').classList.toggle('active', mode === 'hot');
+  init();
+}
+
+function setCat(cat) {
+  st.cat = cat; st.tag = null;
+  document.querySelectorAll('.cat-chip').forEach(el =>
+    el.classList.toggle('active', el.dataset.cat === cat));
+  init();
+}
+
+function toggleTag(tag) {
+  st.tag = st.tag === tag ? null : tag;
+  st.page = 0;
+  init();
+}
+
+function toggleStarFilter() {
+  st.starOnly = !st.starOnly;
+  if (st.starOnly) st.dismissedOnly = false;
+  st.page = 0;
+  document.getElementById('star-filter-btn').classList.toggle('active', st.starOnly);
+  document.getElementById('dismissed-filter-btn').classList.toggle('active', st.dismissedOnly);
+  init();
+}
+
+function toggleDismissedFilter() {
+  st.dismissedOnly = !st.dismissedOnly;
+  if (st.dismissedOnly) st.starOnly = false;
+  st.page = 0;
+  document.getElementById('dismissed-filter-btn').classList.toggle('active', st.dismissedOnly);
+  document.getElementById('star-filter-btn').classList.toggle('active', st.starOnly);
+  init();
+}
+
+async function undismissEntry(url) {
+  const wasIdx = focusIdx;
+  allEntries = allEntries.filter(e => e.url !== url);
+  totalCount = Math.max(0, totalCount - 1);
+  renderAll();
+  if (wasIdx >= 0) setFocus(Math.min(wasIdx, document.querySelectorAll('.entry-card').length - 1));
+  await apiPost('/api/undismiss', { url }).catch(() => {});
+}
+
+async function goPage(n) {
+  const pages = Math.ceil(totalCount / PAGE_SIZE);
+  st.page = Math.max(0, Math.min(n, pages - 1));
+  setStatus('読み込み中…');
+  try {
+    const data = await apiFetch(`/api/entries?${entryParams()}`);
+    allEntries = data.entries;
+    totalCount = data.total;
+    if (allTagPeriod === 'all') allTags = data.top_tags_all || [];
+    else fetchTagsForPeriod();
+    setStatus(`${totalCount}件`);
+    renderAll();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    startTagWatcher();
+  } catch(_) { setStatus('取得失敗', true); }
+}
+
+async function dismissEntry(url) {
+  const wasIdx = focusIdx;
+  allEntries = allEntries.filter(e => e.url !== url);
+  totalCount = Math.max(0, totalCount - 1);
+  renderAll();
+  if (wasIdx >= 0) setFocus(Math.min(wasIdx, document.querySelectorAll('.entry-card').length - 1));
+  await apiPost('/api/dismiss', { url }).catch(() => {});
+}
+
+async function toggleStar(url) {
+  const e = allEntries.find(e => e.url === url);
+  if (!e) return;
+  e.starred = !e.starred;
+  // スターボタンの見た目を更新（トグル）
+  document.querySelectorAll(`.entry-card[data-url="${CSS.escape(url)}"] .star-btn`).forEach(btn => {
+    btn.classList.toggle('on', e.starred);
+    btn.textContent = e.starred ? '★' : '☆';
+  });
+  // スターのみ表示中にスターを外しても記事はそのまま残す（再度Sでトグル可能にする）
+  // リストからの除外は次の更新・ページ遷移時に自然に行われる
+  await apiPost('/api/star', { url, starred: e.starred }).catch(() => {});
+}
+
+async function doRefresh() {
+  setStatus('更新中…');
+  try {
+    await apiPost('/api/refresh', { mode: st.mode, cat: st.cat });
+    const data = await apiFetch(`/api/entries?${entryParams()}`);
+    allEntries = data.entries;
+    totalCount = data.total;
+    if (allTagPeriod === 'all') allTags = data.top_tags_all || [];
+    else fetchTagsForPeriod();
+    setStatus(`${totalCount}件 ／ 更新: ${new Date().toLocaleTimeString('ja-JP')}`);
+    renderAll();
+    startTagWatcher();
+  } catch(e) {
+    setStatus('更新失敗', true);
+  }
+  nextRefreshAt = Date.now() + AUTO_REFRESH_MS;
+}
+
+// ─── Export / Import ──────────────────────────────────────────
+function exportSettings() {
+  window.location.href = '/api/export';
+}
+
+function importSettings(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async ev => {
+    try {
+      const data   = JSON.parse(ev.target.result);
+      const result = await apiPost('/api/import', data);
+      setStatus(`読み込み完了 — ${result.imported}件インポート`);
+      init();
+    } catch(err) {
+      alert('読み込みに失敗しました: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ─── Keyboard navigation ──────────────────────────────────────
+function cardClick(e, idx) {
+  // リンク・ボタン・タグチップへのクリックは通常通り処理
+  if (e.target.closest('a, button, .tag-chip')) return;
+  setFocus(idx);
+}
+
+function setFocus(idx) {
+  const cards = document.querySelectorAll('.entry-card');
+  if (!cards.length) return;
+  idx = Math.max(0, Math.min(idx, cards.length - 1));
+  focusIdx = idx;
+  cards.forEach((el, i) => el.classList.toggle('focused', i === idx));
+  cards[idx]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function getFocusedUrl() {
+  return document.querySelectorAll('.entry-card')[focusIdx]?.dataset?.url;
+}
+
+// ─── Preview Modal ────────────────────────────────────────────
+let _previewUrl = null;
+
+function togglePreview(url) {
+  const modal = document.getElementById('preview-modal');
+  if (modal.classList.contains('open') && _previewUrl === url) {
+    closePreview();
+  } else {
+    openPreview(url);
+  }
+}
+
+function openPreview(url) {
+  const modal  = document.getElementById('preview-modal');
+  const urlBar = document.getElementById('preview-bar-url');
+  const iframe = document.getElementById('preview-iframe');
+  urlBar.innerHTML = `<a href="${h(url)}" target="_blank" rel="noreferrer">${h(url)}</a>`;
+  iframe.src  = `/api/proxy?url=${encodeURIComponent(url)}`;
+  _previewUrl = url;
+  modal.classList.add('open');
+  // iframe内のキー操作を親ページに中継（フォーカスがiframe内に移っても動作させるため）
+  iframe.onload = () => {
+    try {
+      iframe.contentDocument.addEventListener('keydown', e => {
+        if (e.key === 'Escape') { closePreview(); return; }
+        if (e.key === ' ') {
+          e.preventDefault();
+          const dir = e.shiftKey ? -1 : 1;
+          iframe.contentWindow.scrollBy({ top: iframe.contentWindow.innerHeight * 0.9 * dir, behavior: 'smooth' });
+          return;
+        }
+        // s / j / k / d / v / b は親ウィンドウへ転送（iframe にフォーカスがあっても動作させる）
+        if (['s', 'j', 'k', 'd', 'v', 'b'].includes(e.key)) {
+          e.preventDefault();
+          window.dispatchEvent(new KeyboardEvent('keydown', { key: e.key, bubbles: true }));
+        }
+      });
+    } catch(_) {}
+  };
+}
+
+function closePreview() {
+  const modal  = document.getElementById('preview-modal');
+  const iframe = document.getElementById('preview-iframe');
+  modal.classList.remove('open');
+  iframe.src  = 'about:blank';
+  _previewUrl = null;
+}
+
+// モーダル背景クリックで閉じる
+document.getElementById('preview-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('preview-modal')) closePreview();
+});
+
+document.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'r') {
+    e.preventDefault();
+    doRefresh();
+    return;
+  }
+  const inSearch    = document.activeElement === document.getElementById('search-input');
+  const inTagFilter = document.activeElement === document.getElementById('tag-filter-input');
+  if (e.key === 'Escape') {
+    const modal = document.getElementById('preview-modal');
+    if (modal.classList.contains('open')) { closePreview(); return; }
+    if (inSearch) { document.activeElement.blur(); return; }
+    if (inTagFilter) {
+      const el = document.getElementById('tag-filter-input');
+      el.value = ''; filterAllTags(''); el.blur(); return;
+    }
+  }
+  if (e.key === ' ') {
+    const modal = document.getElementById('preview-modal');
+    if (modal.classList.contains('open')) {
+      e.preventDefault();
+      const iframeWin = document.getElementById('preview-iframe').contentWindow;
+      const dir = e.shiftKey ? -1 : 1;
+      iframeWin.scrollBy({ top: iframeWin.innerHeight * 0.9 * dir, behavior: 'smooth' });
+      return;
+    }
+  }
+  // プレビュー表示中に j/k で記事を移動してプレビューを切り替える
+  if (e.key === 'j' || e.key === 'k') {
+    const modal = document.getElementById('preview-modal');
+    if (modal.classList.contains('open')) {
+      e.preventDefault();
+      const newIdx = e.key === 'j'
+        ? (focusIdx < 0 ? 0 : focusIdx + 1)
+        : Math.max(0, focusIdx - 1);
+      setFocus(newIdx);
+      const url = getFocusedUrl();
+      if (url) openPreview(url);
+      return;
+    }
+  }
+  if (inSearch || inTagFilter) return;
+
+  switch(e.key) {
+    case 'j':
+      e.preventDefault();
+      setFocus(focusIdx < 0 ? 0 : focusIdx + 1);
+      break;
+    case 'k':
+      e.preventDefault();
+      setFocus(Math.max(0, focusIdx - 1));
+      break;
+    case 'v': {
+      const url = getFocusedUrl();
+      if (url) togglePreview(url);
+      break;
+    }
+    case 'b': {
+      const url = getFocusedUrl();
+      if (url) {
+        const win = window.open(url, '_blank');
+        if (win) {
+          win.blur();
+          setTimeout(() => window.focus(), 0);
+        }
+      }
+      break;
+    }
+    case 's': { const url = getFocusedUrl(); if (url) toggleStar(url); break; }
+    case 'd': {
+      const url = getFocusedUrl();
+      if (url) { st.dismissedOnly ? undismissEntry(url) : dismissEntry(url); }
+      break;
+    }
+    case 'h': {
+      const pages = Math.ceil(totalCount / PAGE_SIZE);
+      if (st.page < pages - 1) goPage(st.page + 1);  // 前へ（古い）
+      break;
+    }
+    case 'l':
+      if (st.page > 0) goPage(st.page - 1);  // 次へ（新しい）
+      break;
+    case '/':
+      e.preventDefault();
+      document.getElementById('search-input').focus();
+      document.getElementById('search-input').select();
+      break;
+  }
+});
+
+// ─── Search ──────────────────────────────────────────────────
+let searchTimer;
+document.getElementById('search-input').addEventListener('input', e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    st.search = e.target.value.trim();
+    st.page = 0;
+    init();
+  }, 300);
+});
+
+// ─── Auto refresh ────────────────────────────────────────────
+function updateRefreshLabel() {
+  const el = document.getElementById('next-refresh');
+  if (!el) return;
+  const diff = Math.max(0, nextRefreshAt - Date.now());
+  const m = Math.floor(diff / 60000);
+  const s = Math.floor((diff % 60000) / 1000);
+  el.textContent = diff > 0 ? `　次の更新: ${m}:${String(s).padStart(2,'0')}` : '';
+}
+
+function scheduleAutoRefresh() {
+  nextRefreshAt = Date.now() + AUTO_REFRESH_MS;
+  setInterval(async () => {
+    // サーバー側は自動更新しているのでエントリを再取得するだけ
+    try {
+      const data = await apiFetch(`/api/entries?${entryParams()}`);
+      allEntries = data.entries;
+      totalCount = data.total;
+      if (allTagPeriod === 'all') allTags = data.top_tags_all || [];
+    else fetchTagsForPeriod();
+      setStatus(`${totalCount}件 ／ 更新: ${new Date().toLocaleTimeString('ja-JP')}`);
+      renderAll();
+      startTagWatcher();
+    } catch(_) {}
+    nextRefreshAt = Date.now() + AUTO_REFRESH_MS;
+  }, AUTO_REFRESH_MS);
+  setInterval(updateRefreshLabel, 1000);
+}
+
+// ─── Start ───────────────────────────────────────────────────
+init();
+scheduleAutoRefresh();
+</script>
+</body>
+</html>

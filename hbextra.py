@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""はてブニュース+ バックエンド (Flask + SQLite)"""
+
+import json
+import re
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.request import urlopen, Request
+from xml.etree import ElementTree as ET
+
+from flask import Flask, jsonify, request, send_from_directory, Response
+
+try:
+    import pykakasi as _pk
+    _kks = _pk.kakasi()
+except ImportError:
+    _kks = None
+
+_reading_cache: dict = {}
+
+def _tag_reading(tag: str) -> str:
+    """タグのひらがな読みを返す（ローマ字検索用）。pykakasi が無ければ小文字をそのまま返す。"""
+    if tag in _reading_cache:
+        return _reading_cache[tag]
+    if _kks is None:
+        reading = tag.lower()
+    else:
+        reading = ''.join(x.get('hira', '') or x.get('orig', '') for x in _kks.convert(tag)).lower()
+    _reading_cache[tag] = reading
+    return reading
+
+BASE_DIR  = Path(__file__).parent
+DB_PATH   = BASE_DIR / 'hbextra.db'
+HTML_FILE = 'hbextra.html'
+
+REFRESH_INTERVAL = 10 * 60  # 秒
+
+DC_NS     = 'http://purl.org/dc/elements/1.1/'
+HATENA_NS = 'http://www.hatena.ne.jp/info/xmlns#'
+RSS_NS    = 'http://purl.org/rss/1.0/'
+RDF_NS    = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'
+ENTRY_API = 'https://b.hatena.ne.jp/entry/jsonlite/?url='
+
+FEEDS = {
+    'hot': {
+        '':            'https://b.hatena.ne.jp/hotentry.rss',
+        'it':          'https://b.hatena.ne.jp/hotentry/it.rss',
+        'social':      'https://b.hatena.ne.jp/hotentry/social.rss',
+        'fun':         'https://b.hatena.ne.jp/hotentry/fun.rss',
+        'entertainment': 'https://b.hatena.ne.jp/hotentry/entertainment.rss',
+        'knowledge':   'https://b.hatena.ne.jp/hotentry/knowledge.rss',
+        'life':        'https://b.hatena.ne.jp/hotentry/life.rss',
+        'economics':   'https://b.hatena.ne.jp/hotentry/economics.rss',
+        'game':        'https://b.hatena.ne.jp/hotentry/game.rss',
+        'anime':       'https://b.hatena.ne.jp/hotentry/anime.rss',
+    },
+    'new': {
+        '':            'https://b.hatena.ne.jp/entrylist.rss',
+        'it':          'https://b.hatena.ne.jp/entrylist/it.rss',
+        'social':      'https://b.hatena.ne.jp/entrylist/social.rss',
+        'fun':         'https://b.hatena.ne.jp/entrylist/fun.rss',
+        'entertainment': 'https://b.hatena.ne.jp/entrylist/entertainment.rss',
+        'knowledge':   'https://b.hatena.ne.jp/entrylist/knowledge.rss',
+        'life':        'https://b.hatena.ne.jp/entrylist/life.rss',
+        'economics':   'https://b.hatena.ne.jp/entrylist/economics.rss',
+        'game':        'https://b.hatena.ne.jp/entrylist/game.rss',
+        'anime':       'https://b.hatena.ne.jp/entrylist/anime.rss',
+    }
+}
+
+app = Flask(__name__)
+
+# ─── DB ──────────────────────────────────────────────────────────────
+
+_db_lock = threading.Lock()
+
+@contextmanager
+def db_conn():
+    with _db_lock:
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+def init_db():
+    with db_conn() as db:
+        db.execute('''CREATE TABLE IF NOT EXISTS entries (
+            url          TEXT PRIMARY KEY,
+            title        TEXT NOT NULL DEFAULT '',
+            date         TEXT NOT NULL DEFAULT '',
+            count        INTEGER NOT NULL DEFAULT 0,
+            cats         TEXT NOT NULL DEFAULT '[]',
+            tags         TEXT NOT NULL DEFAULT '[]',
+            tags_loaded  INTEGER NOT NULL DEFAULT 0,
+            first_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+            starred      INTEGER NOT NULL DEFAULT 0,
+            dismissed    INTEGER NOT NULL DEFAULT 0
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS memberships (
+            url  TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            cat  TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (url, mode, cat)
+        )''')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_mem_mode_cat ON memberships(mode, cat)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_first_seen ON entries(first_seen)')
+
+# ─── RSS parsing ──────────────────────────────────────────────────────
+
+def fetch_url(url, timeout=10):
+    req = Request(url, headers={'User-Agent': 'Mozilla/5.0 hbextra/2.0'})
+    with urlopen(req, timeout=timeout) as r:
+        return r.read().decode('utf-8', errors='replace')
+
+def parse_rss(xml_text):
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    # RSS 1.0 (RDF) uses namespace-qualified elements
+    items = root.findall(f'{{{RSS_NS}}}item')
+    # Fallback: RSS 2.0 or no namespace
+    if not items:
+        items = root.findall('.//item')
+    entries = []
+    def _find(item, ns_tag, plain_tag):
+        el = item.find(ns_tag)
+        return el if el is not None else item.find(plain_tag)
+
+    for item in items:
+        # URL: prefer rdf:about attribute, then <link> element
+        url = item.get(f'{{{RDF_NS}}}about', '')
+        if not url:
+            link_el = _find(item, f'{{{RSS_NS}}}link', 'link')
+            url = (link_el.text or '').strip() if link_el is not None else ''
+        title_el = _find(item, f'{{{RSS_NS}}}title', 'title')
+        title = (title_el.text or '').strip() if title_el is not None else ''
+        if not url or not title:
+            continue
+        count_el = item.find(f'{{{HATENA_NS}}}bookmarkcount')
+        count = int(count_el.text or '0') if count_el is not None and count_el.text else 0
+        date_el = item.find(f'{{{DC_NS}}}date')
+        if date_el is None:
+            date_el = item.find('pubDate')
+        date = (date_el.text or '').strip() if date_el is not None else ''
+        cats = [el.text.strip() for el in item.findall(f'{{{DC_NS}}}subject') if el.text]
+        entries.append({'url': url, 'title': title, 'count': count, 'date': date, 'cats': cats})
+    return entries
+
+# ─── Feed refresh ─────────────────────────────────────────────────────
+
+last_refresh_at = 0.0
+
+def refresh_feed(mode, cat):
+    feed_url = FEEDS[mode].get(cat, FEEDS[mode][''])
+    try:
+        xml = fetch_url(feed_url, timeout=12)
+        entries = parse_rss(xml)
+        if not entries:
+            return 0
+        with db_conn() as db:
+            for e in entries:
+                db.execute('''
+                    INSERT INTO entries (url, title, date, count, cats)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title = excluded.title,
+                        count = excluded.count,
+                        date  = excluded.date,
+                        cats  = excluded.cats
+                ''', (e['url'], e['title'], e['date'], e['count'],
+                      json.dumps(e['cats'], ensure_ascii=False)))
+                db.execute('''
+                    INSERT OR IGNORE INTO memberships (url, mode, cat) VALUES (?, ?, ?)
+                ''', (e['url'], mode, cat))
+        return len(entries)
+    except Exception as ex:
+        print(f'[feed] {mode}/{cat or "all"}: {ex}')
+        return 0
+
+def refresh_all():
+    global last_refresh_at
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(f'[{ts}] refreshing all feeds…')
+    total = 0
+    for mode in FEEDS:
+        for cat in FEEDS[mode]:
+            n = refresh_feed(mode, cat)
+            total += n
+            time.sleep(0.3)
+    last_refresh_at = time.time()
+    print(f'[refresh] done — {total} entries')
+
+# ─── Tag loading ──────────────────────────────────────────────────────
+
+def load_one_tag(url):
+    try:
+        text = fetch_url(ENTRY_API + url, timeout=10)
+        data = json.loads(text)
+        cnt = {}
+        for bm in data.get('bookmarks', []):
+            for tag in bm.get('tags', []):
+                cnt[tag] = cnt.get(tag, 0) + 1
+        tags = [{'tag': t, 'count': c}
+                for t, c in sorted(cnt.items(), key=lambda x: -x[1])]
+        with db_conn() as db:
+            db.execute('UPDATE entries SET tags=?, tags_loaded=1 WHERE url=?',
+                       (json.dumps(tags, ensure_ascii=False), url))
+    except Exception:
+        # Mark as attempted (2) so we don't retry endlessly
+        try:
+            with db_conn() as db:
+                db.execute('UPDATE entries SET tags_loaded=2 WHERE url=?', (url,))
+        except Exception:
+            pass
+
+def tag_loader_bg():
+    """Background: load tags for entries without them."""
+    while True:
+        try:
+            with db_conn() as db:
+                row = db.execute(
+                    'SELECT url FROM entries WHERE tags_loaded=0 AND dismissed=0 LIMIT 1'
+                ).fetchone()
+            if row:
+                load_one_tag(row['url'])
+                time.sleep(0.5)
+            else:
+                time.sleep(30)
+        except Exception as ex:
+            print(f'[tags] {ex}')
+            time.sleep(5)
+
+def refresh_scheduler():
+    refresh_all()
+    while True:
+        time.sleep(REFRESH_INTERVAL)
+        refresh_all()
+
+# ─── API ──────────────────────────────────────────────────────────────
+
+@app.route('/')
+def index():
+    return send_from_directory(str(BASE_DIR), HTML_FILE)
+
+@app.route('/api/entries')
+def api_entries():
+    mode       = request.args.get('mode', 'new')
+    cat        = request.args.get('cat', '')
+    page       = max(0, int(request.args.get('page', 0)))
+    per_page   = min(500, max(1, int(request.args.get('per_page', 100))))
+    search     = request.args.get('search', '').strip()
+    tag_filter = request.args.get('tag', '').strip()
+    star_only      = request.args.get('star_only',      'false') == 'true'
+    dismissed_only = request.args.get('dismissed_only', 'false') == 'true'
+
+    # cat='' のとき：そのモードの全カテゴリを集約（重複なし）
+    # cat='it' 等：そのカテゴリのみ
+    if cat == '':
+        mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=?)'
+        params = [mode]
+    else:
+        mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=? AND m.cat=?)'
+        params = [mode, cat]
+
+    if dismissed_only:
+        where = ['e.dismissed=1', mem_cond]
+    else:
+        where = ['e.dismissed=0', mem_cond]
+
+    if star_only and not dismissed_only:
+        where.append('e.starred=1')
+    if search:
+        where.append('(e.title LIKE ? OR e.cats LIKE ? OR e.tags LIKE ?)')
+        s = f'%{search}%'
+        params += [s, s, s]
+    if tag_filter:
+        where.append('e.tags LIKE ?')
+        params.append(f'%"{tag_filter}"%')
+
+    sql_where = ' AND '.join(where)
+    base_sql = f'FROM entries e WHERE {sql_where}'
+
+    with db_conn() as db:
+        total = db.execute(
+            f'SELECT COUNT(*) {base_sql}', params
+        ).fetchone()[0]
+        rows = db.execute(
+            f'SELECT e.url,e.title,e.date,e.count,e.cats,e.tags,e.tags_loaded,e.starred '
+            f'{base_sql} '
+            f'ORDER BY e.first_seen DESC LIMIT ? OFFSET ?',
+            params + [per_page, page * per_page]
+        ).fetchall()
+        # タグクラウド（下部）：全期間で集計
+        all_tag_rows = db.execute(
+            f'SELECT e.tags, e.date {base_sql}', params
+        ).fetchall()
+
+    cnt       = {}
+    last_date = {}
+    for row in all_tag_rows:
+        d = row[1] or ''
+        for t in json.loads(row[0] or '[]'):
+            tag = t.get('tag', '')
+            if tag:
+                cnt[tag] = cnt.get(tag, 0) + t.get('count', 0)
+                if d > last_date.get(tag, ''):
+                    last_date[tag] = d
+    top_tags_all = [{'tag': t, 'count': c, 'last': last_date.get(t, ''), 'reading': _tag_reading(t)}
+                    for t, c in sorted(cnt.items(), key=lambda x: -x[1]) if c >= 2][:1000]
+
+    entries = [{
+        'url':        r['url'],
+        'title':      r['title'],
+        'date':       r['date'],
+        'count':      r['count'],
+        'cats':       json.loads(r['cats'] or '[]'),
+        'tags':       json.loads(r['tags'] or '[]'),
+        'tagsLoaded': r['tags_loaded'] >= 1,
+        'starred':    bool(r['starred']),
+    } for r in rows]
+
+    return jsonify({'entries': entries, 'total': total, 'page': page,
+                    'top_tags_all': top_tags_all})
+
+@app.route('/api/status')
+def api_status():
+    with db_conn() as db:
+        total   = db.execute('SELECT COUNT(*) FROM entries WHERE dismissed=0').fetchone()[0]
+        starred = db.execute('SELECT COUNT(*) FROM entries WHERE starred=1').fetchone()[0]
+        no_tags = db.execute('SELECT COUNT(*) FROM entries WHERE tags_loaded=0 AND dismissed=0').fetchone()[0]
+    return jsonify({
+        'total':           total,
+        'starred':         starred,
+        'no_tags':         no_tags,
+        'last_refresh_at': int(last_refresh_at * 1000),
+        'now':             int(time.time() * 1000),
+    })
+
+@app.route('/api/refresh', methods=['POST'])
+def api_refresh():
+    """現在のフィードを同期的に更新し、他はバックグラウンドで更新する。"""
+    global last_refresh_at
+    data = request.json or {}
+    mode = data.get('mode', 'new')
+    cat  = data.get('cat', '')
+
+    # 現在表示中のフィードを先に更新（即時反映）
+    refresh_feed(mode, cat)
+    last_refresh_at = time.time()
+
+    # 残りをバックグラウンドで更新
+    def refresh_rest():
+        global last_refresh_at
+        for m in FEEDS:
+            for c in FEEDS[m]:
+                if m == mode and c == cat:
+                    continue
+                refresh_feed(m, c)
+                time.sleep(0.3)
+        last_refresh_at = time.time()
+
+    threading.Thread(target=refresh_rest, daemon=True).start()
+    return jsonify({'ok': True})
+
+class _TextExtractor(HTMLParser):
+    """HTML から本文テキストを抽出するシンプルなパーサー"""
+    SKIP_TAGS = {'script','style','noscript','nav','footer','header','aside','form','button'}
+    BLOCK_TAGS = {'p','div','li','h1','h2','h3','h4','h5','h6','br','tr','article','section'}
+
+    def __init__(self):
+        super().__init__()
+        self._buf, self._depth, self._skip_depth = [], [], None
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if self._skip_depth is None and t in self.SKIP_TAGS:
+            self._skip_depth = len(self._depth)
+        self._depth.append(t)
+        if t in self.BLOCK_TAGS:
+            self._buf.append('\n')
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if self._depth and self._depth[-1] == t:
+            self._depth.pop()
+        if self._skip_depth is not None and len(self._depth) <= self._skip_depth:
+            self._skip_depth = None
+        if t in self.BLOCK_TAGS:
+            self._buf.append('\n')
+
+    def handle_data(self, data):
+        if self._skip_depth is None:
+            self._buf.append(data)
+
+    def get_text(self):
+        lines = [l.strip() for l in ''.join(self._buf).splitlines()]
+        return '\n'.join(l for l in lines if l)
+
+@app.route('/api/preview')
+def api_preview():
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({'error': 'no url'}), 400
+    try:
+        html = fetch_url(url, timeout=12)
+        title_m = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
+        title = title_m.group(1).strip() if title_m else ''
+        # HTMLエンティティを簡易デコード
+        title = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), title)
+        title = title.replace('&amp;','&').replace('&lt;','<').replace('&gt;','>').replace('&quot;','"')
+        extractor = _TextExtractor()
+        extractor.feed(html)
+        text = extractor.get_text()
+        return jsonify({'title': title, 'text': text[:8000]})
+    except Exception as ex:
+        return jsonify({'error': str(ex)}), 500
+
+def _period_cutoff(period):
+    """期間文字列 → (from_date, to_date) ISO文字列のタプル（Noneは制限なし）"""
+    now   = datetime.now(timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == 'today':
+        return today.isoformat(), None
+    elif period == 'yesterday':
+        return (today - timedelta(days=1)).isoformat(), today.isoformat()
+    elif period == '7d':
+        return (now - timedelta(days=7)).isoformat(), None
+    elif period == '30d':
+        return (now - timedelta(days=30)).isoformat(), None
+    elif period == '90d':
+        return (now - timedelta(days=90)).isoformat(), None
+    elif period == '1y':
+        return (now - timedelta(days=365)).isoformat(), None
+    return None, None  # 'all'
+
+@app.route('/api/tags')
+def api_tags():
+    mode   = request.args.get('mode', 'new')
+    cat    = request.args.get('cat', '')
+    period = request.args.get('period', 'all')
+    if cat == '':
+        mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=?)'
+        params = [mode]
+    else:
+        mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=? AND m.cat=?)'
+        params = [mode, cat]
+    sql = f'FROM entries e WHERE e.dismissed=0 AND {mem_cond}'
+    from_d, to_d = _period_cutoff(period)
+    if from_d:
+        sql += ' AND e.date >= ?'; params.append(from_d)
+    if to_d:
+        sql += ' AND e.date < ?';  params.append(to_d)
+    with db_conn() as db:
+        rows = db.execute(f'SELECT e.tags, e.date {sql}', params).fetchall()
+    cnt = {}; last_date = {}
+    for row in rows:
+        d = row[1] or ''
+        for t in json.loads(row[0] or '[]'):
+            tag = t.get('tag', '')
+            if tag:
+                cnt[tag] = cnt.get(tag, 0) + t.get('count', 0)
+                if d > last_date.get(tag, ''):
+                    last_date[tag] = d
+    tags = [{'tag': t, 'count': c, 'last': last_date.get(t, ''), 'reading': _tag_reading(t)}
+            for t, c in sorted(cnt.items(), key=lambda x: -x[1]) if c >= 2][:1000]
+    return jsonify({'tags': tags})
+
+@app.route('/api/proxy')
+def api_proxy():
+    """X-Frame-Options/CSP を除去してページをプロキシ配信する"""
+    url = request.args.get('url', '').strip()
+    if not url:
+        return 'no url', 400
+    try:
+        req = Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9',
+            'Accept-Language': 'ja,en;q=0.9',
+        })
+        with urlopen(req, timeout=15) as resp:
+            ct = resp.headers.get('Content-Type', 'text/html')
+            body = resp.read()
+    except Exception as ex:
+        err = f'<h2>読み込みエラー</h2><p>{ex}</p><p><a href="{url}" target="_blank">元のページを開く →</a></p>'
+        return Response(err, content_type='text/html; charset=utf-8')
+
+    if 'html' in ct.lower():
+        text = body.decode('utf-8', errors='replace')
+        # <base> タグで相対URLを元サイト基準に解決
+        base_tag = f'<base href="{url}" target="_blank">'
+        text = re.sub(r'(<head[^>]*>)', r'\1' + base_tag, text, count=1, flags=re.I)
+        body = text.encode('utf-8')
+        ct = 'text/html; charset=utf-8'
+
+    # X-Frame-Options / CSP は返さない（これがポイント）
+    return Response(body, content_type=ct)
+
+@app.route('/api/star', methods=['POST'])
+def api_star():
+    d   = request.json or {}
+    url = d.get('url', '')
+    val = 1 if d.get('starred', False) else 0
+    with db_conn() as db:
+        db.execute('UPDATE entries SET starred=? WHERE url=?', (val, url))
+    return jsonify({'ok': True})
+
+@app.route('/api/dismiss', methods=['POST'])
+def api_dismiss():
+    d   = request.json or {}
+    url = d.get('url', '')
+    with db_conn() as db:
+        db.execute('UPDATE entries SET dismissed=1 WHERE url=?', (url,))
+    return jsonify({'ok': True})
+
+@app.route('/api/undismiss', methods=['POST'])
+def api_undismiss():
+    d   = request.json or {}
+    url = d.get('url', '')
+    with db_conn() as db:
+        db.execute('UPDATE entries SET dismissed=0 WHERE url=?', (url,))
+    return jsonify({'ok': True})
+
+@app.route('/api/export')
+def api_export():
+    with db_conn() as db:
+        entries = [dict(r) for r in db.execute('SELECT * FROM entries').fetchall()]
+        mems    = [dict(r) for r in db.execute('SELECT * FROM memberships').fetchall()]
+    data = {
+        'version':     4,
+        'exportedAt':  datetime.now(timezone.utc).isoformat(),
+        'entries':     entries,
+        'memberships': mems,
+    }
+    filename = f'hbextra-{datetime.now().strftime("%Y-%m-%d")}.json'
+    return Response(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        mimetype='application/json',
+        headers={'Content-Disposition': f'attachment; filename={filename}'}
+    )
+
+@app.route('/api/import', methods=['POST'])
+def api_import():
+    data = request.json
+    if not data or 'entries' not in data:
+        return jsonify({'ok': False, 'error': 'invalid format'}), 400
+    count = 0
+    with db_conn() as db:
+        for e in data['entries']:
+            cats = e.get('cats', '[]')
+            tags = e.get('tags', '[]')
+            db.execute('''
+                INSERT OR REPLACE INTO entries
+                (url,title,date,count,cats,tags,tags_loaded,first_seen,starred,dismissed)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            ''', (
+                e.get('url', ''), e.get('title', ''), e.get('date', ''),
+                e.get('count', 0),
+                cats if isinstance(cats, str) else json.dumps(cats, ensure_ascii=False),
+                tags if isinstance(tags, str) else json.dumps(tags, ensure_ascii=False),
+                e.get('tags_loaded', 0),
+                e.get('first_seen', datetime.now().isoformat()),
+                e.get('starred', 0), e.get('dismissed', 0)
+            ))
+            count += 1
+        for m in data.get('memberships', []):
+            db.execute('INSERT OR IGNORE INTO memberships (url,mode,cat) VALUES (?,?,?)',
+                       (m.get('url',''), m.get('mode','new'), m.get('cat','')))
+    return jsonify({'ok': True, 'imported': count})
+
+# ─── Start ────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    init_db()
+    threading.Thread(target=refresh_scheduler, daemon=True).start()
+    threading.Thread(target=tag_loader_bg,     daemon=True).start()
+    print('はてブニュース+ → http://localhost:8000')
+    app.run(host='127.0.0.1', port=8000, debug=False, threaded=True)
