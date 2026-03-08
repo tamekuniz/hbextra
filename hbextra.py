@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""はてブニュース+ バックエンド (Flask + SQLite)"""
+"""HBExtra バックエンド (Flask + SQLite)"""
 
 import json
 import re
@@ -588,5 +588,5 @@ if __name__ == '__main__':
     init_db()
     threading.Thread(target=refresh_scheduler, daemon=True).start()
     threading.Thread(target=tag_loader_bg,     daemon=True).start()
-    print('はてブニュース+ → http://localhost:8000')
+    print('HBExtra → http://localhost:8000')
     app.run(host='127.0.0.1', port=8000, debug=False, threaded=True)
