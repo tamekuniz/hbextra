@@ -1,3 +1,6 @@
+# hbextra database (ローカルデータのため除外)
+*.db
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
