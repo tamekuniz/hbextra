@@ -1,27 +1,33 @@
-# はてブニュース+ インストール手順
+# hbextra インストール手順
 
 ## 必要なもの
 - Mac（macOS 12以降推奨）
 - Python 3（macOS には標準でインストール済み）
+- GitHub Desktop（https://desktop.github.com）
 
 ---
 
 ## 手順
 
-### 1. ファイルをコピー
+### 1. GitHub Desktop をインストール
 
-以下の2ファイルを、新しいMacの任意のフォルダにコピーする。
+https://desktop.github.com からダウンロードしてインストールする。
 
-```
-hbnews.py
-hbnews.html
-```
-
-例：`/Users/（ユーザー名）/ClaudeCode/` に置く
+GitHubアカウント（tamekuniz）でサインインする。
 
 ---
 
-### 2. Pythonパッケージをインストール
+### 2. リポジトリをClone
+
+GitHub Desktop を開いて：
+
+`tamekuniz/hbextra` を Clone する。
+
+保存先は任意のフォルダでOK。例：`/Users/（ユーザー名）/ClaudeCode/`
+
+---
+
+### 3. Pythonパッケージをインストール
 
 ターミナルを開いて以下を実行：
 
@@ -33,11 +39,11 @@ pip3 install flask pykakasi
 
 ---
 
-### 3. 起動する
+### 4. 起動する
 
 ```bash
-cd /Users/（ユーザー名）/ClaudeCode
-python3 hbnews.py
+cd /Users/（ユーザー名）/ClaudeCode/hbextra
+python3 hbextra.py
 ```
 
 起動後、ブラウザで以下にアクセス：
@@ -48,9 +54,15 @@ http://localhost:8000
 
 ---
 
-### 4. 停止する
+### 5. 停止する
 
 ターミナルで `Ctrl + C` を押す
+
+---
+
+## 最新版に更新するには
+
+GitHub Desktop を開いて「**Fetch origin**」→「**Pull origin**」を押すだけ！
 
 ---
 
@@ -66,7 +78,7 @@ python3 -m pip install flask pykakasi
 ```
 
 ### ポート8000が使用中と出る
-`hbnews.py` の末尾近くにある以下の行を探して、`8000` を別の番号（例：`8001`）に変更する：
+`hbextra.py` の末尾近くにある以下の行を探して、`8000` を別の番号（例：`8001`）に変更する：
 ```python
 app.run(host='0.0.0.0', port=8000, ...)
 ```
@@ -74,7 +86,6 @@ app.run(host='0.0.0.0', port=8000, ...)
 ---
 
 ## データについて
-- 記事データは `hbnews.db`（SQLite）に自動保存される
-- スター・非表示の情報も `hbnews.db` に入っている
-- 別のMacにデータを移したい場合は `hbnews.db` もコピーする
-- バックアップはアプリ内の「エクスポート」ボタンからも可能
+- 記事データは `hbextra.db`（SQLite）に自動保存される
+- スター・非表示の情報も `hbextra.db` に入っている
+- データのバックアップはアプリ内の「エクスポート」ボタンからも可能
