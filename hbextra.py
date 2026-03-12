@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """HBExtra バックエンド (Flask + SQLite)"""
 
+import hashlib
 import json
+import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.request import urlopen, Request
 from xml.etree import ElementTree as ET
 
-from flask import Flask, jsonify, request, send_from_directory, Response
+from flask import Flask, jsonify, request, send_from_directory, Response, session, redirect
 
 try:
     import pykakasi as _pk
@@ -75,6 +79,14 @@ FEEDS = {
 
 app = Flask(__name__)
 
+# セッション用の秘密鍵（永続化）
+_secret_path = BASE_DIR / '.secret_key'
+if _secret_path.exists():
+    app.secret_key = _secret_path.read_text().strip()
+else:
+    app.secret_key = secrets.token_hex(32)
+    _secret_path.write_text(app.secret_key)
+
 # ─── DB ──────────────────────────────────────────────────────────────
 
 _db_lock = threading.Lock()
@@ -116,6 +128,59 @@ def init_db():
         )''')
         db.execute('CREATE INDEX IF NOT EXISTS idx_mem_mode_cat ON memberships(mode, cat)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_first_seen ON entries(first_seen)')
+        # ── ユーザー関連テーブル ──
+        db.execute('''CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS user_stars (
+            user_id INTEGER NOT NULL,
+            url     TEXT NOT NULL,
+            PRIMARY KEY (user_id, url)
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS user_dismissed (
+            user_id INTEGER NOT NULL,
+            url     TEXT NOT NULL,
+            PRIMARY KEY (user_id, url)
+        )''')
+
+# ─── Auth ─────────────────────────────────────────────────────────────
+
+def hash_password(pw):
+    salt = secrets.token_hex(16)
+    h = hashlib.sha256((salt + pw).encode()).hexdigest()
+    return f'{salt}:{h}'
+
+def verify_password(pw, stored):
+    salt, h = stored.split(':', 1)
+    return hashlib.sha256((salt + pw).encode()).hexdigest() == h
+
+def get_current_user_id():
+    return session.get('user_id')
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not get_current_user_id():
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'login required'}), 401
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return decorated
+
+def migrate_legacy_data(user_id):
+    """既存のstarred/dismissedデータを新テーブルに移行（初回ユーザー登録時）"""
+    with db_conn() as db:
+        rows = db.execute('SELECT url FROM entries WHERE starred=1').fetchall()
+        for r in rows:
+            db.execute('INSERT OR IGNORE INTO user_stars (user_id, url) VALUES (?, ?)',
+                       (user_id, r['url']))
+        rows = db.execute('SELECT url FROM entries WHERE dismissed=1').fetchall()
+        for r in rows:
+            db.execute('INSERT OR IGNORE INTO user_dismissed (user_id, url) VALUES (?, ?)',
+                       (user_id, r['url']))
 
 # ─── RSS parsing ──────────────────────────────────────────────────────
 
@@ -232,7 +297,7 @@ def tag_loader_bg():
         try:
             with db_conn() as db:
                 row = db.execute(
-                    'SELECT url FROM entries WHERE tags_loaded=0 AND dismissed=0 LIMIT 1'
+                    'SELECT url FROM entries WHERE tags_loaded=0 LIMIT 1'
                 ).fetchone()
             if row:
                 load_one_tag(row['url'])
@@ -251,12 +316,123 @@ def refresh_scheduler():
 
 # ─── API ──────────────────────────────────────────────────────────────
 
+LOGIN_PAGE = '''<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HBExtra - ログイン</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #f0f2f5; display: flex;
+         align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { background: #fff; padding: 32px; border-radius: 12px;
+          box-shadow: 0 2px 16px rgba(0,0,0,.1); width: 320px; }
+  h1 { font-size: 22px; margin: 0 0 20px; text-align: center; color: #008fde; }
+  input { width: 100%; padding: 10px; margin: 6px 0; border: 1px solid #ddd;
+          border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+  input:focus { outline: none; border-color: #008fde; }
+  .btn { width: 100%; padding: 10px; border: none; border-radius: 6px;
+         font-size: 14px; cursor: pointer; margin: 6px 0; }
+  .btn-primary { background: #008fde; color: #fff; }
+  .btn-secondary { background: #eee; color: #333; }
+  .btn:hover { opacity: .85; }
+  .error { color: #c00; font-size: 13px; text-align: center; margin: 8px 0; }
+  .toggle { text-align: center; font-size: 13px; color: #666; margin-top: 12px; }
+  .toggle a { color: #008fde; cursor: pointer; text-decoration: none; }
+</style></head><body>
+<div class="card">
+  <h1>HBExtra</h1>
+  <div id="error" class="error"></div>
+  <form id="form">
+    <input id="username" name="username" placeholder="ユーザー名" required autocomplete="username">
+    <input id="password" name="password" type="password" placeholder="パスワード" required autocomplete="current-password">
+    <button type="submit" class="btn btn-primary" id="submit-btn">ログイン</button>
+  </form>
+  <div class="toggle"><a id="toggle-link" onclick="toggleMode()">アカウントを作成する</a></div>
+</div>
+<script>
+let isRegister = false;
+function toggleMode() {
+  isRegister = !isRegister;
+  document.getElementById('submit-btn').textContent = isRegister ? '登録' : 'ログイン';
+  document.getElementById('toggle-link').textContent = isRegister ? 'ログインに戻る' : 'アカウントを作成する';
+  document.getElementById('error').textContent = '';
+}
+document.getElementById('form').onsubmit = async e => {
+  e.preventDefault();
+  const body = { username: document.getElementById('username').value,
+                 password: document.getElementById('password').value };
+  const url = isRegister ? '/api/register' : '/api/login';
+  const r = await fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const data = await r.json();
+  if (data.ok) { window.location.href = '/'; }
+  else { document.getElementById('error').textContent = data.error || 'エラーが発生しました'; }
+};
+</script></body></html>'''
+
+@app.route('/login')
+def login_page():
+    if get_current_user_id():
+        return redirect('/')
+    return LOGIN_PAGE
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    d = request.json or {}
+    username = d.get('username', '').strip()
+    password = d.get('password', '')
+    if not username or not password:
+        return jsonify({'ok': False, 'error': 'ユーザー名とパスワードを入力してください'})
+    with db_conn() as db:
+        user = db.execute('SELECT id, password_hash FROM users WHERE username=?', (username,)).fetchone()
+    if not user or not verify_password(password, user['password_hash']):
+        return jsonify({'ok': False, 'error': 'ユーザー名またはパスワードが違います'})
+    session['user_id'] = user['id']
+    session['username'] = username
+    return jsonify({'ok': True})
+
+@app.route('/api/register', methods=['POST'])
+def api_register():
+    d = request.json or {}
+    username = d.get('username', '').strip()
+    password = d.get('password', '')
+    if not username or not password:
+        return jsonify({'ok': False, 'error': 'ユーザー名とパスワードを入力してください'})
+    if len(password) < 4:
+        return jsonify({'ok': False, 'error': 'パスワードは4文字以上にしてください'})
+    with db_conn() as db:
+        existing = db.execute('SELECT id FROM users WHERE username=?', (username,)).fetchone()
+        if existing:
+            return jsonify({'ok': False, 'error': 'このユーザー名は既に使われています'})
+        is_first = db.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0
+        db.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)',
+                   (username, hash_password(password)))
+        user = db.execute('SELECT id FROM users WHERE username=?', (username,)).fetchone()
+    if is_first:
+        migrate_legacy_data(user['id'])
+    session['user_id'] = user['id']
+    session['username'] = username
+    return jsonify({'ok': True})
+
+@app.route('/api/me')
+def api_me():
+    uid = get_current_user_id()
+    if not uid:
+        return jsonify({'ok': False})
+    return jsonify({'ok': True, 'user_id': uid, 'username': session.get('username', '')})
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
+
 @app.route('/')
+@login_required
 def index():
     return send_from_directory(str(BASE_DIR), HTML_FILE)
 
 @app.route('/api/entries')
+@login_required
 def api_entries():
+    uid        = get_current_user_id()
     mode       = request.args.get('mode', 'new')
     cat        = request.args.get('cat', '')
     page       = max(0, int(request.args.get('page', 0)))
@@ -266,8 +442,6 @@ def api_entries():
     star_only      = request.args.get('star_only',      'false') == 'true'
     dismissed_only = request.args.get('dismissed_only', 'false') == 'true'
 
-    # cat='' のとき：そのモードの全カテゴリを集約（重複なし）
-    # cat='it' 等：そのカテゴリのみ
     if cat == '':
         mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=?)'
         params = [mode]
@@ -275,13 +449,19 @@ def api_entries():
         mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=? AND m.cat=?)'
         params = [mode, cat]
 
+    dismissed_cond = 'EXISTS (SELECT 1 FROM user_dismissed ud WHERE ud.user_id=? AND ud.url=e.url)'
+    not_dismissed_cond = 'NOT ' + dismissed_cond
+
     if dismissed_only:
-        where = ['e.dismissed=1', mem_cond]
+        where = [dismissed_cond, mem_cond]
+        params = [uid] + params
     else:
-        where = ['e.dismissed=0', mem_cond]
+        where = [not_dismissed_cond, mem_cond]
+        params = [uid] + params
 
     if star_only and not dismissed_only:
-        where.append('e.starred=1')
+        where.append('EXISTS (SELECT 1 FROM user_stars us WHERE us.user_id=? AND us.url=e.url)')
+        params.append(uid)
     if search:
         where.append('(e.title LIKE ? OR e.cats LIKE ? OR e.tags LIKE ?)')
         s = f'%{search}%'
@@ -298,12 +478,12 @@ def api_entries():
             f'SELECT COUNT(*) {base_sql}', params
         ).fetchone()[0]
         rows = db.execute(
-            f'SELECT e.url,e.title,e.date,e.count,e.cats,e.tags,e.tags_loaded,e.starred '
+            f'SELECT e.url,e.title,e.date,e.count,e.cats,e.tags,e.tags_loaded,'
+            f'EXISTS(SELECT 1 FROM user_stars us WHERE us.user_id=? AND us.url=e.url) as starred '
             f'{base_sql} '
             f'ORDER BY e.first_seen DESC LIMIT ? OFFSET ?',
-            params + [per_page, page * per_page]
+            [uid] + params + [per_page, page * per_page]
         ).fetchall()
-        # タグクラウド（下部）：全期間で集計
         all_tag_rows = db.execute(
             f'SELECT e.tags, e.date {base_sql}', params
         ).fetchall()
@@ -336,11 +516,19 @@ def api_entries():
                     'top_tags_all': top_tags_all})
 
 @app.route('/api/status')
+@login_required
 def api_status():
+    uid = get_current_user_id()
     with db_conn() as db:
-        total   = db.execute('SELECT COUNT(*) FROM entries WHERE dismissed=0').fetchone()[0]
-        starred = db.execute('SELECT COUNT(*) FROM entries WHERE starred=1').fetchone()[0]
-        no_tags = db.execute('SELECT COUNT(*) FROM entries WHERE tags_loaded=0 AND dismissed=0').fetchone()[0]
+        total   = db.execute(
+            'SELECT COUNT(*) FROM entries e WHERE NOT EXISTS '
+            '(SELECT 1 FROM user_dismissed ud WHERE ud.user_id=? AND ud.url=e.url)', (uid,)
+        ).fetchone()[0]
+        starred = db.execute('SELECT COUNT(*) FROM user_stars WHERE user_id=?', (uid,)).fetchone()[0]
+        no_tags = db.execute(
+            'SELECT COUNT(*) FROM entries e WHERE e.tags_loaded=0 AND NOT EXISTS '
+            '(SELECT 1 FROM user_dismissed ud WHERE ud.user_id=? AND ud.url=e.url)', (uid,)
+        ).fetchone()[0]
     return jsonify({
         'total':           total,
         'starred':         starred,
@@ -350,6 +538,7 @@ def api_status():
     })
 
 @app.route('/api/refresh', methods=['POST'])
+@login_required
 def api_refresh():
     """現在のフィードを同期的に更新し、他はバックグラウンドで更新する。"""
     global last_refresh_at
@@ -410,6 +599,7 @@ class _TextExtractor(HTMLParser):
         return '\n'.join(l for l in lines if l)
 
 @app.route('/api/preview')
+@login_required
 def api_preview():
     url = request.args.get('url', '').strip()
     if not url:
@@ -447,17 +637,19 @@ def _period_cutoff(period):
     return None, None  # 'all'
 
 @app.route('/api/tags')
+@login_required
 def api_tags():
+    uid    = get_current_user_id()
     mode   = request.args.get('mode', 'new')
     cat    = request.args.get('cat', '')
     period = request.args.get('period', 'all')
     if cat == '':
         mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=?)'
-        params = [mode]
+        params = [uid, mode]
     else:
         mem_cond = 'EXISTS (SELECT 1 FROM memberships m WHERE m.url=e.url AND m.mode=? AND m.cat=?)'
-        params = [mode, cat]
-    sql = f'FROM entries e WHERE e.dismissed=0 AND {mem_cond}'
+        params = [uid, mode, cat]
+    sql = f'FROM entries e WHERE NOT EXISTS (SELECT 1 FROM user_dismissed ud WHERE ud.user_id=? AND ud.url=e.url) AND {mem_cond}'
     from_d, to_d = _period_cutoff(period)
     if from_d:
         sql += ' AND e.date >= ?'; params.append(from_d)
@@ -479,6 +671,7 @@ def api_tags():
     return jsonify({'tags': tags})
 
 @app.route('/api/proxy')
+@login_required
 def api_proxy():
     """X-Frame-Options/CSP を除去してページをプロキシ配信する"""
     url = request.args.get('url', '').strip()
@@ -511,40 +704,56 @@ def api_proxy():
     return Response(body, content_type=ct)
 
 @app.route('/api/star', methods=['POST'])
+@login_required
 def api_star():
+    uid = get_current_user_id()
     d   = request.json or {}
     url = d.get('url', '')
-    val = 1 if d.get('starred', False) else 0
+    starred = d.get('starred', False)
     with db_conn() as db:
-        db.execute('UPDATE entries SET starred=? WHERE url=?', (val, url))
+        if starred:
+            db.execute('INSERT OR IGNORE INTO user_stars (user_id, url) VALUES (?, ?)', (uid, url))
+        else:
+            db.execute('DELETE FROM user_stars WHERE user_id=? AND url=?', (uid, url))
     return jsonify({'ok': True})
 
 @app.route('/api/dismiss', methods=['POST'])
+@login_required
 def api_dismiss():
+    uid = get_current_user_id()
     d   = request.json or {}
     url = d.get('url', '')
     with db_conn() as db:
-        db.execute('UPDATE entries SET dismissed=1 WHERE url=?', (url,))
+        db.execute('INSERT OR IGNORE INTO user_dismissed (user_id, url) VALUES (?, ?)', (uid, url))
     return jsonify({'ok': True})
 
 @app.route('/api/undismiss', methods=['POST'])
+@login_required
 def api_undismiss():
+    uid = get_current_user_id()
     d   = request.json or {}
     url = d.get('url', '')
     with db_conn() as db:
-        db.execute('UPDATE entries SET dismissed=0 WHERE url=?', (url,))
+        db.execute('DELETE FROM user_dismissed WHERE user_id=? AND url=?', (uid, url))
     return jsonify({'ok': True})
 
 @app.route('/api/export')
+@login_required
 def api_export():
+    uid = get_current_user_id()
     with db_conn() as db:
         entries = [dict(r) for r in db.execute('SELECT * FROM entries').fetchall()]
         mems    = [dict(r) for r in db.execute('SELECT * FROM memberships').fetchall()]
+        stars   = [r['url'] for r in db.execute('SELECT url FROM user_stars WHERE user_id=?', (uid,)).fetchall()]
+        dismissed = [r['url'] for r in db.execute('SELECT url FROM user_dismissed WHERE user_id=?', (uid,)).fetchall()]
     data = {
-        'version':     4,
+        'version':     5,
         'exportedAt':  datetime.now(timezone.utc).isoformat(),
+        'username':    session.get('username', ''),
         'entries':     entries,
         'memberships': mems,
+        'user_stars':  stars,
+        'user_dismissed': dismissed,
     }
     filename = f'hbextra-{datetime.now().strftime("%Y-%m-%d")}.json'
     return Response(
@@ -554,7 +763,9 @@ def api_export():
     )
 
 @app.route('/api/import', methods=['POST'])
+@login_required
 def api_import():
+    uid  = get_current_user_id()
     data = request.json
     if not data or 'entries' not in data:
         return jsonify({'ok': False, 'error': 'invalid format'}), 400
@@ -574,12 +785,24 @@ def api_import():
                 tags if isinstance(tags, str) else json.dumps(tags, ensure_ascii=False),
                 e.get('tags_loaded', 0),
                 e.get('first_seen', datetime.now().isoformat()),
-                e.get('starred', 0), e.get('dismissed', 0)
+                0, 0
             ))
             count += 1
         for m in data.get('memberships', []):
             db.execute('INSERT OR IGNORE INTO memberships (url,mode,cat) VALUES (?,?,?)',
                        (m.get('url',''), m.get('mode','new'), m.get('cat','')))
+        # ユーザー固有のスター/非表示をインポート
+        for url in data.get('user_stars', []):
+            db.execute('INSERT OR IGNORE INTO user_stars (user_id, url) VALUES (?, ?)', (uid, url))
+        for url in data.get('user_dismissed', []):
+            db.execute('INSERT OR IGNORE INTO user_dismissed (user_id, url) VALUES (?, ?)', (uid, url))
+        # v4以前の形式にも対応（entries内のstarred/dismissed）
+        if data.get('version', 0) < 5:
+            for e in data['entries']:
+                if e.get('starred', 0):
+                    db.execute('INSERT OR IGNORE INTO user_stars (user_id, url) VALUES (?, ?)', (uid, e['url']))
+                if e.get('dismissed', 0):
+                    db.execute('INSERT OR IGNORE INTO user_dismissed (user_id, url) VALUES (?, ?)', (uid, e['url']))
     return jsonify({'ok': True, 'imported': count})
 
 # ─── Start ────────────────────────────────────────────────────────────
@@ -588,5 +811,7 @@ if __name__ == '__main__':
     init_db()
     threading.Thread(target=refresh_scheduler, daemon=True).start()
     threading.Thread(target=tag_loader_bg,     daemon=True).start()
-    print('HBExtra → http://localhost:8000')
-    app.run(host='127.0.0.1', port=8000, debug=False, threaded=True)
+    import socket
+    local_ip = socket.gethostbyname(socket.gethostname())
+    print(f'HBExtra → http://localhost:8000  (LAN: http://{local_ip}:8000)')
+    app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)

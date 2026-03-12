@@ -1,6 +1,9 @@
 # hbextra database (ローカルデータのため除外)
 *.db
 
+# セッション秘密鍵
+.secret_key
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
