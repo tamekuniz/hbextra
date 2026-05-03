@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from xml.etree import ElementTree as ET
 
-from flask import Flask, jsonify, request, send_from_directory, Response, session, redirect
+from flask import Flask, jsonify, request, send_from_directory, Response, session, redirect, url_for
 
 try:
     import pykakasi as _pk
@@ -39,7 +39,8 @@ def _tag_reading(tag: str) -> str:
     return reading
 
 BASE_DIR  = Path(__file__).parent
-DB_PATH   = BASE_DIR / 'hbextra.db'
+DATA_DIR  = Path(os.environ.get('HBEXTRA_DATA_DIR', BASE_DIR))
+DB_PATH   = DATA_DIR / 'hbextra.db'
 HTML_FILE = 'hbextra.html'
 
 REFRESH_INTERVAL = 10 * 60  # 秒
@@ -79,8 +80,15 @@ FEEDS = {
 
 app = Flask(__name__)
 
+# /hbextra prefix で配信するための WSGI middleware
+# - URL は /hbextra/login のように prefix 付きで来る
+# - Flask の url_for() は自動的に /hbextra/... を返すようになる
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+from werkzeug.exceptions import NotFound
+app.wsgi_app = DispatcherMiddleware(NotFound(), {'/hbextra': app.wsgi_app})
+
 # セッション用の秘密鍵（永続化）
-_secret_path = BASE_DIR / '.secret_key'
+_secret_path = DATA_DIR / '.secret_key'
 if _secret_path.exists():
     app.secret_key = _secret_path.read_text().strip()
 else:
@@ -166,7 +174,7 @@ def login_required(f):
         if not get_current_user_id():
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'login required'}), 401
-            return redirect('/login')
+            return redirect(url_for('login_page'))
         return f(*args, **kwargs)
     return decorated
 
@@ -371,7 +379,7 @@ document.getElementById('form').onsubmit = async e => {
 @app.route('/login')
 def login_page():
     if get_current_user_id():
-        return redirect('/')
+        return redirect(url_for('index'))
     return LOGIN_PAGE
 
 @app.route('/api/login', methods=['POST'])
@@ -422,7 +430,7 @@ def api_me():
 @app.route('/logout')
 def logout():
     session.clear()
-    return redirect('/login')
+    return redirect(url_for('login_page'))
 
 @app.route('/')
 @login_required
