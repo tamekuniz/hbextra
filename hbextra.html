@@ -447,7 +447,7 @@
     <button class="hbtn"        id="btn-hot" onclick="setMode('hot')">人気</button>
     <button class="hbtn" onclick="doRefresh()">↻&nbsp;更新</button>
     <span id="user-info" style="font-size:12px;opacity:.8;margin-left:auto"></span>
-    <button class="hbtn" onclick="window.location.href='/hbextra/logout'" style="font-size:11px;padding:3px 10px">ログアウト</button>
+    <button class="hbtn" onclick="logout()" style="font-size:11px;padding:3px 10px">ログアウト</button>
   </div>
 </div>
 
@@ -529,7 +529,7 @@
       <span id="preview-hint">Space: スクロール　V / Esc: 閉じる</span>
       <button id="preview-close" onclick="closePreview()" title="閉じる（V / Esc）">✕</button>
     </div>
-    <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+    <iframe id="preview-iframe" sandbox="allow-scripts allow-forms allow-popups"></iframe>
   </div>
 </div>
 
@@ -550,8 +550,14 @@ let nextRefreshAt = 0;
 let tagWatcher = null;
 
 // ─── API helpers ─────────────────────────────────────────────
+let csrfToken = '';
+
 async function apiFetch(path, opts = {}) {
-  const r = await fetch(BASE_PATH + path, opts);
+  const method = (opts.method || 'GET').toUpperCase();
+  const needsCsrf = method !== 'GET' && method !== 'HEAD';
+  const headers = { ...(opts.headers || {}) };
+  if (needsCsrf && csrfToken) headers['X-CSRF-Token'] = csrfToken;
+  const r = await fetch(BASE_PATH + path, { ...opts, headers });
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }
@@ -561,6 +567,12 @@ async function apiPost(path, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+async function logout() {
+  // サーバー側 logout が失敗しても client redirect は強行する fail-safe
+  try { await apiPost('/logout', {}); }
+  catch(e) { console.warn('logout request failed:', e); }
+  window.location.href = BASE_PATH + '/login';
 }
 function entryParams() {
   return new URLSearchParams({
@@ -982,28 +994,11 @@ function openPreview(url) {
   const urlBar = document.getElementById('preview-bar-url');
   const iframe = document.getElementById('preview-iframe');
   urlBar.innerHTML = `<a href="${h(url)}" target="_blank" rel="noreferrer">${h(url)}</a>`;
-  iframe.src  = `/api/proxy?url=${encodeURIComponent(url)}`;
+  iframe.src = `${BASE_PATH}/api/proxy?url=${encodeURIComponent(url)}`;
   _previewUrl = url;
   modal.classList.add('open');
-  // iframe内のキー操作を親ページに中継（フォーカスがiframe内に移っても動作させるため）
-  iframe.onload = () => {
-    try {
-      iframe.contentDocument.addEventListener('keydown', e => {
-        if (e.key === 'Escape') { closePreview(); return; }
-        if (e.key === ' ') {
-          e.preventDefault();
-          const dir = e.shiftKey ? -1 : 1;
-          iframe.contentWindow.scrollBy({ top: iframe.contentWindow.innerHeight * 0.9 * dir, behavior: 'smooth' });
-          return;
-        }
-        // s / j / k / d / v / b は親ウィンドウへ転送（iframe にフォーカスがあっても動作させる）
-        if (['s', 'j', 'k', 'd', 'v', 'b'].includes(e.key)) {
-          e.preventDefault();
-          window.dispatchEvent(new KeyboardEvent('keydown', { key: e.key, bubbles: true }));
-        }
-      });
-    } catch(_) {}
-  };
+  // iframe 内フォーカス時のキー操作は親フレームの keydown ハンドラ (Esc/Space/j/k 等) で受ける仕様。
+  // sandbox から allow-same-origin を外しているため iframe.contentDocument には触れない。
 }
 
 function closePreview() {
@@ -1040,9 +1035,13 @@ document.addEventListener('keydown', e => {
     const modal = document.getElementById('preview-modal');
     if (modal.classList.contains('open')) {
       e.preventDefault();
-      const iframeWin = document.getElementById('preview-iframe').contentWindow;
-      const dir = e.shiftKey ? -1 : 1;
-      iframeWin.scrollBy({ top: iframeWin.innerHeight * 0.9 * dir, behavior: 'smooth' });
+      try {
+        const iframeWin = document.getElementById('preview-iframe').contentWindow;
+        const dir = e.shiftKey ? -1 : 1;
+        iframeWin.scrollBy({ top: iframeWin.innerHeight * 0.9 * dir, behavior: 'smooth' });
+      } catch(_) {
+        // cross-origin sandbox では innerHeight/scrollBy 不可。スクロールは諦めるが modal 表示は維持
+      }
       return;
     }
   }
@@ -1150,15 +1149,19 @@ function scheduleAutoRefresh() {
 }
 
 // ─── Start ───────────────────────────────────────────────────
-// ユーザー名を表示
+// /api/me を init() より先に同期完了させて csrfToken を埋めてから初回描画に進む
+// （doRefresh など POST 系を CSRF 通過させるため）
 (async () => {
   try {
     const me = await apiFetch('/api/me');
-    if (me.ok) document.getElementById('user-info').textContent = me.username;
+    if (me.ok) {
+      document.getElementById('user-info').textContent = me.username;
+      csrfToken = me.csrf_token || '';
+    }
   } catch(_) {}
+  init();
+  scheduleAutoRefresh();
 })();
-init();
-scheduleAutoRefresh();
 </script>
 </body>
 </html>

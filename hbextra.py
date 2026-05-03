@@ -2,22 +2,28 @@
 """HBExtra バックエンド (Flask + SQLite)"""
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.request import urlopen, Request
+from urllib.error import HTTPError
+from urllib.parse import urlparse
+from urllib.request import urlopen, Request, build_opener, HTTPRedirectHandler
 from xml.etree import ElementTree as ET
 
 from flask import Flask, jsonify, request, send_from_directory, Response, session, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
     import pykakasi as _pk
@@ -83,9 +89,17 @@ app = Flask(__name__)
 # /hbextra prefix で配信するための WSGI middleware
 # - URL は /hbextra/login のように prefix 付きで来る
 # - Flask の url_for() は自動的に /hbextra/... を返すようになる
+# - prefix 外（ローカル直起動の `/`）は /hbextra/ へ 302 リダイレクトしてユーザー導線を救う
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
-from werkzeug.exceptions import NotFound
-app.wsgi_app = DispatcherMiddleware(NotFound(), {'/hbextra': app.wsgi_app})
+
+_HBEXTRA_PREFIX = '/hbextra'
+
+def _root_redirect_app(environ, start_response):
+    target = _HBEXTRA_PREFIX + '/'
+    start_response('302 Found', [('Location', target), ('Content-Type', 'text/plain; charset=utf-8')])
+    return [b'Redirecting to /hbextra/']
+
+app.wsgi_app = DispatcherMiddleware(_root_redirect_app, {_HBEXTRA_PREFIX: app.wsgi_app})
 
 # セッション用の秘密鍵（永続化）
 _secret_path = DATA_DIR / '.secret_key'
@@ -94,6 +108,13 @@ if _secret_path.exists():
 else:
     app.secret_key = secrets.token_hex(32)
     _secret_path.write_text(app.secret_key)
+
+# CSRF + cookie hardening: HttpOnly で JS から触れないようにし、SameSite=Lax で
+# 第三者 origin からの cookie 送信を遮断する（GET の navigation には影響しない）
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+)
 
 # ─── DB ──────────────────────────────────────────────────────────────
 
@@ -154,16 +175,91 @@ def init_db():
             PRIMARY KEY (user_id, url)
         )''')
 
+# ─── Helpers (validation, JSON, HTTP) ────────────────────────────────
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """SSRF 対策: redirect を一切追従しない（短縮 URL → 内部 IP の経路を塞ぐ）"""
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise HTTPError(req.full_url, code, f'redirect blocked: {msg}', headers, fp)
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+_no_redirect_opener = build_opener(_NoRedirectHandler())
+
+def _validate_external_url(raw_url):
+    if not raw_url or not isinstance(raw_url, str):
+        raise ValueError('missing url')
+    parsed = urlparse(raw_url.strip())
+    if parsed.scheme not in {'http', 'https'}:
+        raise ValueError('unsupported scheme')
+    host = parsed.hostname
+    if not host:
+        raise ValueError('missing hostname')
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as ex:
+        raise ValueError('host resolution failed') from ex
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_loopback or ip.is_private or ip.is_link_local or
+                ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            raise ValueError('internal address is not allowed')
+    return raw_url
+
+def _normalize_json_array(value, field_name):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as ex:
+            raise ValueError(f'{field_name} is not valid JSON') from ex
+    if not isinstance(value, list):
+        raise ValueError(f'{field_name} must be a list')
+    return value
+
+def _safe_json_array(raw):
+    """一行壊れただけで /api/entries や /api/tags が 500 にならないよう、不正 JSON は [] に潰す。"""
+    try:
+        value = json.loads(raw or '[]')
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return value if isinstance(value, list) else []
+
+def _parse_int_arg(name, default, *, min_value=None, max_value=None):
+    raw = request.args.get(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f'invalid {name}')
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
 # ─── Auth ─────────────────────────────────────────────────────────────
 
+_LEGACY_HASH_RE = re.compile(r'[0-9a-f]{32}:[0-9a-f]{64}')
+
 def hash_password(pw):
-    salt = secrets.token_hex(16)
-    h = hashlib.sha256((salt + pw).encode()).hexdigest()
-    return f'{salt}:{h}'
+    return generate_password_hash(pw)
+
+def _is_legacy_hash(stored):
+    """ffdf6c1 以前の 'salt_hex:sha256_hex' 形式を判定。新形式は werkzeug の prefix で始まる。"""
+    if not stored:
+        return False
+    return bool(_LEGACY_HASH_RE.fullmatch(stored))
 
 def verify_password(pw, stored):
-    salt, h = stored.split(':', 1)
-    return hashlib.sha256((salt + pw).encode()).hexdigest() == h
+    if _is_legacy_hash(stored):
+        salt, h = stored.split(':', 1)
+        return hashlib.sha256((salt + pw).encode()).hexdigest() == h
+    try:
+        return check_password_hash(stored, pw)
+    except (ValueError, TypeError):
+        return False
 
 def get_current_user_id():
     return session.get('user_id')
@@ -175,6 +271,23 @@ def login_required(f):
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'login required'}), 401
             return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated
+
+def _issue_csrf_token():
+    token = session.get('csrf_token')
+    if not token:
+        token = secrets.token_hex(16)
+        session['csrf_token'] = token
+    return token
+
+def csrf_protected(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('X-CSRF-Token', '')
+        expected = session.get('csrf_token', '')
+        if not token or not expected or not secrets.compare_digest(token, expected):
+            return jsonify({'error': 'csrf token invalid'}), 403
         return f(*args, **kwargs)
     return decorated
 
@@ -192,9 +305,10 @@ def migrate_legacy_data(user_id):
 
 # ─── RSS parsing ──────────────────────────────────────────────────────
 
-def fetch_url(url, timeout=10):
+def fetch_url(url, timeout=10, follow_redirects=True):
     req = Request(url, headers={'User-Agent': 'Mozilla/5.0 hbextra/2.0'})
-    with urlopen(req, timeout=timeout) as r:
+    opener = urlopen if follow_redirects else _no_redirect_opener.open
+    with opener(req, timeout=timeout) as r:
         return r.read().decode('utf-8', errors='replace')
 
 def parse_rss(xml_text):
@@ -237,6 +351,8 @@ def parse_rss(xml_text):
 last_refresh_at = 0.0
 
 def refresh_feed(mode, cat):
+    if mode not in FEEDS:
+        return 0
     feed_url = FEEDS[mode].get(cat, FEEDS[mode][''])
     try:
         xml = fetch_url(feed_url, timeout=12)
@@ -393,8 +509,13 @@ def api_login():
         user = db.execute('SELECT id, password_hash FROM users WHERE username=?', (username,)).fetchone()
     if not user or not verify_password(password, user['password_hash']):
         return jsonify({'ok': False, 'error': 'ユーザー名またはパスワードが違います'})
+    if _is_legacy_hash(user['password_hash']):
+        with db_conn() as db:
+            db.execute('UPDATE users SET password_hash=? WHERE id=?',
+                       (hash_password(password), user['id']))
     session['user_id'] = user['id']
     session['username'] = username
+    _issue_csrf_token()
     return jsonify({'ok': True})
 
 @app.route('/api/register', methods=['POST'])
@@ -418,6 +539,7 @@ def api_register():
         migrate_legacy_data(user['id'])
     session['user_id'] = user['id']
     session['username'] = username
+    _issue_csrf_token()
     return jsonify({'ok': True})
 
 @app.route('/api/me')
@@ -425,12 +547,19 @@ def api_me():
     uid = get_current_user_id()
     if not uid:
         return jsonify({'ok': False})
-    return jsonify({'ok': True, 'user_id': uid, 'username': session.get('username', '')})
+    return jsonify({
+        'ok': True,
+        'user_id': uid,
+        'username': session.get('username', ''),
+        'csrf_token': _issue_csrf_token(),
+    })
 
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
+@login_required
+@csrf_protected
 def logout():
     session.clear()
-    return redirect(url_for('login_page'))
+    return jsonify({'ok': True})
 
 @app.route('/')
 @login_required
@@ -443,8 +572,11 @@ def api_entries():
     uid        = get_current_user_id()
     mode       = request.args.get('mode', 'new')
     cat        = request.args.get('cat', '')
-    page       = max(0, int(request.args.get('page', 0)))
-    per_page   = min(500, max(1, int(request.args.get('per_page', 100))))
+    try:
+        page     = _parse_int_arg('page', 0, min_value=0)
+        per_page = _parse_int_arg('per_page', 100, min_value=1, max_value=500)
+    except ValueError as ex:
+        return jsonify({'error': str(ex)}), 400
     search     = request.args.get('search', '').strip()
     tag_filter = request.args.get('tag', '').strip()
     star_only      = request.args.get('star_only',      'false') == 'true'
@@ -500,8 +632,8 @@ def api_entries():
     last_date = {}
     for row in all_tag_rows:
         d = row[1] or ''
-        for t in json.loads(row[0] or '[]'):
-            tag = t.get('tag', '')
+        for t in _safe_json_array(row[0]):
+            tag = t.get('tag', '') if isinstance(t, dict) else ''
             if tag:
                 cnt[tag] = cnt.get(tag, 0) + t.get('count', 0)
                 if d > last_date.get(tag, ''):
@@ -514,8 +646,8 @@ def api_entries():
         'title':      r['title'],
         'date':       r['date'],
         'count':      r['count'],
-        'cats':       json.loads(r['cats'] or '[]'),
-        'tags':       json.loads(r['tags'] or '[]'),
+        'cats':       _safe_json_array(r['cats']),
+        'tags':       _safe_json_array(r['tags']),
         'tagsLoaded': r['tags_loaded'] >= 1,
         'starred':    bool(r['starred']),
     } for r in rows]
@@ -547,12 +679,17 @@ def api_status():
 
 @app.route('/api/refresh', methods=['POST'])
 @login_required
+@csrf_protected
 def api_refresh():
     """現在のフィードを同期的に更新し、他はバックグラウンドで更新する。"""
     global last_refresh_at
     data = request.json or {}
     mode = data.get('mode', 'new')
     cat  = data.get('cat', '')
+    if mode not in FEEDS:
+        return jsonify({'error': 'invalid mode'}), 400
+    if cat and cat not in FEEDS[mode]:
+        return jsonify({'error': 'invalid cat'}), 400
 
     # 現在表示中のフィードを先に更新（即時反映）
     refresh_feed(mode, cat)
@@ -609,11 +746,13 @@ class _TextExtractor(HTMLParser):
 @app.route('/api/preview')
 @login_required
 def api_preview():
-    url = request.args.get('url', '').strip()
-    if not url:
-        return jsonify({'error': 'no url'}), 400
+    raw_url = request.args.get('url', '').strip()
     try:
-        html = fetch_url(url, timeout=12)
+        url = _validate_external_url(raw_url)
+    except ValueError as ex:
+        return jsonify({'error': str(ex)}), 400
+    try:
+        html = fetch_url(url, timeout=12, follow_redirects=False)
         title_m = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
         title = title_m.group(1).strip() if title_m else ''
         # HTMLエンティティを簡易デコード
@@ -668,8 +807,8 @@ def api_tags():
     cnt = {}; last_date = {}
     for row in rows:
         d = row[1] or ''
-        for t in json.loads(row[0] or '[]'):
-            tag = t.get('tag', '')
+        for t in _safe_json_array(row[0]):
+            tag = t.get('tag', '') if isinstance(t, dict) else ''
             if tag:
                 cnt[tag] = cnt.get(tag, 0) + t.get('count', 0)
                 if d > last_date.get(tag, ''):
@@ -682,9 +821,11 @@ def api_tags():
 @login_required
 def api_proxy():
     """X-Frame-Options/CSP を除去してページをプロキシ配信する"""
-    url = request.args.get('url', '').strip()
-    if not url:
-        return 'no url', 400
+    raw_url = request.args.get('url', '').strip()
+    try:
+        url = _validate_external_url(raw_url)
+    except ValueError as ex:
+        return jsonify({'error': str(ex)}), 400
     try:
         req = Request(url, headers={
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -693,12 +834,15 @@ def api_proxy():
             'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9',
             'Accept-Language': 'ja,en;q=0.9',
         })
-        with urlopen(req, timeout=15) as resp:
+        with _no_redirect_opener.open(req, timeout=15) as resp:
             ct = resp.headers.get('Content-Type', 'text/html')
             body = resp.read()
     except Exception as ex:
-        err = f'<h2>読み込みエラー</h2><p>{ex}</p><p><a href="{url}" target="_blank">元のページを開く →</a></p>'
-        return Response(err, content_type='text/html; charset=utf-8')
+        # SSRF 文脈で urllib 例外文字列が内部 IP / ポート / ホスト名を含む可能性があるため、
+        # ユーザーには詳細を返さずサーバーログにのみ残す
+        print(f'[proxy] fetch failed url={url}: {ex}')
+        err_html = f'<h2>読み込みエラー</h2><p><a href="{escape(url)}" target="_blank">元のページを開く →</a></p>'
+        return Response(err_html, content_type='text/html; charset=utf-8')
 
     if 'html' in ct.lower():
         text = body.decode('utf-8', errors='replace')
@@ -713,6 +857,7 @@ def api_proxy():
 
 @app.route('/api/star', methods=['POST'])
 @login_required
+@csrf_protected
 def api_star():
     uid = get_current_user_id()
     d   = request.json or {}
@@ -727,6 +872,7 @@ def api_star():
 
 @app.route('/api/dismiss', methods=['POST'])
 @login_required
+@csrf_protected
 def api_dismiss():
     uid = get_current_user_id()
     d   = request.json or {}
@@ -737,6 +883,7 @@ def api_dismiss():
 
 @app.route('/api/undismiss', methods=['POST'])
 @login_required
+@csrf_protected
 def api_undismiss():
     uid = get_current_user_id()
     d   = request.json or {}
@@ -772,25 +919,38 @@ def api_export():
 
 @app.route('/api/import', methods=['POST'])
 @login_required
+@csrf_protected
 def api_import():
     uid  = get_current_user_id()
     data = request.json
-    if not data or 'entries' not in data:
+    if not data or 'entries' not in data or not isinstance(data['entries'], list):
         return jsonify({'ok': False, 'error': 'invalid format'}), 400
+    # まず全エントリを検証してから DB に書く（中途半端な書き込みを避ける）
+    try:
+        normalized = []
+        for e in data['entries']:
+            if not isinstance(e, dict):
+                raise ValueError('entry must be an object')
+            cats = _normalize_json_array(e.get('cats', []), 'cats')
+            tags = _normalize_json_array(e.get('tags', []), 'tags')
+            normalized.append((e, cats, tags))
+    except ValueError as ex:
+        return jsonify({'ok': False, 'error': str(ex)}), 400
+
     count = 0
     with db_conn() as db:
-        for e in data['entries']:
-            cats = e.get('cats', '[]')
-            tags = e.get('tags', '[]')
+        for e, cats, tags in normalized:
+            # 共有 entries は import で上書きしない（他ユーザーのデータを退行させないため）
             db.execute('''
-                INSERT OR REPLACE INTO entries
+                INSERT INTO entries
                 (url,title,date,count,cats,tags,tags_loaded,first_seen,starred,dismissed)
                 VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(url) DO NOTHING
             ''', (
                 e.get('url', ''), e.get('title', ''), e.get('date', ''),
                 e.get('count', 0),
-                cats if isinstance(cats, str) else json.dumps(cats, ensure_ascii=False),
-                tags if isinstance(tags, str) else json.dumps(tags, ensure_ascii=False),
+                json.dumps(cats, ensure_ascii=False),
+                json.dumps(tags, ensure_ascii=False),
                 e.get('tags_loaded', 0),
                 e.get('first_seen', datetime.now().isoformat()),
                 0, 0
@@ -819,7 +979,10 @@ if __name__ == '__main__':
     init_db()
     threading.Thread(target=refresh_scheduler, daemon=True).start()
     threading.Thread(target=tag_loader_bg,     daemon=True).start()
-    import socket
-    local_ip = socket.gethostbyname(socket.gethostname())
-    print(f'HBExtra → http://localhost:8000  (LAN: http://{local_ip}:8000)')
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+        lan_part = f'  (LAN: http://{local_ip}:8000)'
+    except OSError:
+        lan_part = ''
+    print(f'HBExtra → http://localhost:8000{lan_part}')
     app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
