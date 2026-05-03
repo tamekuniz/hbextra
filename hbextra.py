@@ -368,10 +368,10 @@ document.getElementById('form').onsubmit = async e => {
   e.preventDefault();
   const body = { username: document.getElementById('username').value,
                  password: document.getElementById('password').value };
-  const url = isRegister ? '/api/register' : '/api/login';
+  const url = isRegister ? '/hbextra/api/register' : '/hbextra/api/login';
   const r = await fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   const data = await r.json();
-  if (data.ok) { window.location.href = '/'; }
+  if (data.ok) { window.location.href = '/hbextra/'; }
   else { document.getElementById('error').textContent = data.error || 'エラーが発生しました'; }
 };
 </script></body></html>'''
