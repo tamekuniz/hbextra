@@ -8,7 +8,9 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/jonji/Project/tmknzz/HBExtra/.venv/bin/gunicorn</string>
+    <string>/Users/jonji/Project/tamekuniz/HBExtra/.venv/bin/python</string>
+    <string>-m</string>
+    <string>gunicorn</string>
     <string>--workers</string>
     <string>1</string>
     <string>--bind</string>
@@ -17,7 +19,7 @@
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/jonji/Project/tmknzz/HBExtra</string>
+  <string>/Users/jonji/Project/tamekuniz/HBExtra</string>
 
   <key>EnvironmentVariables</key>
   <dict>
