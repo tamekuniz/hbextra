@@ -515,6 +515,7 @@
       <button class="sort-btn" data-sort="count"  onclick="setAllTagSort('count')">件数順</button>
       <button class="sort-btn" data-sort="latest" onclick="setAllTagSort('latest')">最新順</button>
       <button class="sort-btn" data-sort="alpha"  onclick="setAllTagSort('alpha')">文字順</button>
+      <button class="sort-btn" id="tag-fold-btn" onclick="toggleTagFold()">大文字小文字をまとめる</button>
     </div>
     <div id="tag-cloud-all"></div>
   </div>
@@ -579,7 +580,7 @@ function entryParams() {
     mode: st.mode, cat: st.cat, page: st.page,
     per_page: PAGE_SIZE, search: st.search || '',
     tag: st.tag || '', star_only: st.starOnly,
-    dismissed_only: st.dismissedOnly,
+    dismissed_only: st.dismissedOnly, fold: allTagFold ? '1' : '0',
   });
 }
 
@@ -596,7 +597,7 @@ function safeCount(v) {
 }
 function tagChips(tags, limit = 10) {
   return tags.slice(0, limit).map(({tag}) =>
-    `<span class="tag-chip${st.tag===tag?' active':''}" data-tag="${h(tag)}" onclick="toggleTag(this.dataset.tag)">${h(tag)}</span>`
+    `<span class="tag-chip${sameTag(st.tag, tag)?' active':''}" data-tag="${h(tag)}" onclick="toggleTag(this.dataset.tag)">${h(tag)}</span>`
   ).join('');
 }
 function fmtDate(d) {
@@ -661,13 +662,25 @@ function renderPagination(total) {
 
 function _tagChipsFull(tags) {
   return tags.map(({tag, count}) =>
-    `<span class="tag-chip${st.tag===tag?' active':''}" data-tag="${h(tag)}" onclick="toggleTag(this.dataset.tag)">${h(tag)}<span class="tag-cnt"> ${safeCount(count)}</span></span>`
+    `<span class="tag-chip${sameTag(st.tag, tag)?' active':''}" data-tag="${h(tag)}" onclick="toggleTag(this.dataset.tag)">${h(tag)}<span class="tag-cnt"> ${safeCount(count)}</span></span>`
   ).join('');
 }
 let allTagSort   = localStorage.getItem('allTagSort')   || 'count';
 let allTagPeriod = localStorage.getItem('allTagPeriod') || 'all';
+let allTagFold   = localStorage.getItem('allTagFold') === '1';  // 英字の大小だけ違うタグをまとめる
 let allTagQuery  = '';
 let _tagCloudNaturalHeight = 0;  // 絞り込み前の自然な高さ（レイアウトシフト防止用）
+
+function sameTag(a, b) {
+  if (!a) return false;
+  return allTagFold ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function toggleTagFold() {
+  allTagFold = !allTagFold;
+  localStorage.setItem('allTagFold', allTagFold ? '1' : '0');
+  init();
+}
 
 function filterAllTags(q) {
   const footer = document.getElementById('page-footer');
@@ -692,7 +705,7 @@ function setAllTagSort(s) {
 }
 
 async function fetchTagsForPeriod() {
-  const params = new URLSearchParams({ mode: st.mode, cat: st.cat, period: allTagPeriod });
+  const params = new URLSearchParams({ mode: st.mode, cat: st.cat, period: allTagPeriod, fold: allTagFold ? '1' : '0' });
   try {
     const data = await apiFetch(`/api/tags?${params}`);
     allTags = data.tags || [];
@@ -727,6 +740,7 @@ function renderAllTagCloud() {
   document.querySelectorAll('.sort-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.sort === allTagSort)
   );
+  document.getElementById('tag-fold-btn').classList.toggle('active', allTagFold);
   document.querySelectorAll('.period-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.period === allTagPeriod)
   );
@@ -763,11 +777,21 @@ function renderAllTagCloud() {
 
 function renderTagCloud() {
   // 上部：現在ページの記事からタグを集計
-  const cnt = {};
+  // まとめる場合は小文字をキーにし、表記ごとの件数から最多の表記を表示に使う
+  const cnt = {}, variants = {};
   for (const e of allEntries) {
-    for (const {tag, count} of e.tags) cnt[tag] = (cnt[tag] ?? 0) + safeCount(count);
+    for (const {tag, count} of e.tags) {
+      const key = allTagFold ? tag.toLowerCase() : tag;
+      const c = safeCount(count);
+      cnt[key] = (cnt[key] ?? 0) + c;
+      if (allTagFold) {
+        const v = variants[key] ??= {};
+        v[tag] = (v[tag] ?? 0) + c;
+      }
+    }
   }
-  const pageTags = Object.entries(cnt).filter(([,c])=>c>1).sort((a,b)=>b[1]-a[1]).map(([tag,count]) => ({tag, count}));
+  const pageTags = Object.entries(cnt).filter(([,c])=>c>1).sort((a,b)=>b[1]-a[1])
+    .map(([key,count]) => ({tag: allTagFold ? Object.entries(variants[key]).sort((a,b)=>b[1]-a[1])[0][0] : key, count}));
   const wrap = document.getElementById('tag-cloud-wrap');
   if (!pageTags.length) { wrap.style.display = 'none'; }
   else { wrap.style.display = ''; document.getElementById('tag-cloud').innerHTML = _tagChipsFull(pageTags); }
@@ -850,7 +874,7 @@ function setCat(cat) {
 }
 
 function toggleTag(tag) {
-  st.tag = st.tag === tag ? null : tag;
+  st.tag = sameTag(st.tag, tag) ? null : tag;
   st.page = 0;
   init();
 }
