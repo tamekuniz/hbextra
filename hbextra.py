@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import threading
 import time
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -606,6 +607,30 @@ def _safe_tag_count(item):
     count = item.get('count', 0)
     return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
 
+def _aggregate_tags(rows, fold=False):
+    """rows は (tags JSON, date)。fold なら英字の大小だけ違うタグを1つにまとめ、件数の多い表記で返す。"""
+    cnt = Counter(); last_date = {}; variants = defaultdict(Counter)
+    for row in rows:
+        d = row[1] or ''
+        for t in _safe_json_array(row[0]):
+            tag = t.get('tag', '') if isinstance(t, dict) else ''
+            if not tag:
+                continue
+            key = tag.lower() if fold else tag
+            c = _safe_tag_count(t)
+            cnt[key] += c
+            if fold:
+                variants[key][tag] += c
+            if d > last_date.get(key, ''):
+                last_date[key] = d
+    result = []
+    for k, c in cnt.most_common():
+        if c < 2 or len(result) >= 1000:
+            break
+        tag = variants[k].most_common(1)[0][0] if fold else k
+        result.append({'tag': tag, 'count': c, 'last': last_date.get(k, ''), 'reading': _tag_reading(tag)})
+    return result
+
 # ─── Feed refresh ─────────────────────────────────────────────────────
 
 last_refresh_at = 0.0
@@ -896,18 +921,7 @@ def api_entries():
             f'SELECT e.tags, e.date {base_sql}', params
         ).fetchall()
 
-    cnt       = {}
-    last_date = {}
-    for row in all_tag_rows:
-        d = row[1] or ''
-        for t in _safe_json_array(row[0]):
-            tag = t.get('tag', '') if isinstance(t, dict) else ''
-            if tag:
-                cnt[tag] = cnt.get(tag, 0) + _safe_tag_count(t)
-                if d > last_date.get(tag, ''):
-                    last_date[tag] = d
-    top_tags_all = [{'tag': t, 'count': c, 'last': last_date.get(t, ''), 'reading': _tag_reading(t)}
-                    for t, c in sorted(cnt.items(), key=lambda x: -x[1]) if c >= 2][:1000]
+    top_tags_all = _aggregate_tags(all_tag_rows, request.args.get('fold') == '1')
 
     entries = [{
         'url':        r['url'],
@@ -1094,18 +1108,7 @@ def api_tags():
         sql += ' AND e.date < ?';  params.append(to_d)
     with db_conn() as db:
         rows = db.execute(f'SELECT e.tags, e.date {sql}', params).fetchall()
-    cnt = {}; last_date = {}
-    for row in rows:
-        d = row[1] or ''
-        for t in _safe_json_array(row[0]):
-            tag = t.get('tag', '') if isinstance(t, dict) else ''
-            if tag:
-                cnt[tag] = cnt.get(tag, 0) + _safe_tag_count(t)
-                if d > last_date.get(tag, ''):
-                    last_date[tag] = d
-    tags = [{'tag': t, 'count': c, 'last': last_date.get(t, ''), 'reading': _tag_reading(t)}
-            for t, c in sorted(cnt.items(), key=lambda x: -x[1]) if c >= 2][:1000]
-    return jsonify({'tags': tags})
+    return jsonify({'tags': _aggregate_tags(rows, request.args.get('fold') == '1')})
 
 @app.route('/api/proxy')
 @login_required
